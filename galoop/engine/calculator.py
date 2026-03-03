@@ -1,8 +1,9 @@
 """
-gocia/engine/calculator.py
+galoop/engine/calculator.py
 
-Multi-stage calculator pipeline: MACE, VASP, or hybrid.
-Handles job submission, status tracking, and energy reading.
+Multi-stage calculator pipeline: MACE-MP and/or VASP.
+
+Each stage relaxes the geometry and writes a CONTCAR for the next stage.
 """
 
 from __future__ import annotations
@@ -14,43 +15,48 @@ from typing import NamedTuple
 import numpy as np
 from ase import Atoms
 from ase.io import read, write
-from ase.calculators.mace import MACE
-from ase.calculators.vasp import Vasp
-from ase.constraints import StrainFilter, UnitCellFilter
-from ase.filters import FrechetCellFilter
-from ase.optimize import BFGS, FIRE
+from ase.optimize import BFGS
 
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Result container
+# ---------------------------------------------------------------------------
+
 class StageResult(NamedTuple):
-    """Result of a single calculator stage."""
+    """Outcome of a single calculator stage."""
     converged: bool
     energy: float
     n_steps: int
     trajectory_file: str | None
 
 
+# ---------------------------------------------------------------------------
+# Single stage
+# ---------------------------------------------------------------------------
+
 class CalculatorStage:
-    """Single stage in a multi-stage pipeline."""
+    """One stage in the multi-stage relaxation pipeline."""
 
     def __init__(
         self,
         name: str,
-        calc_type: str,
+        type: str,                       # noqa: A002 — shadows builtin; kept for config compat
         fmax: float = 0.05,
         max_steps: int = 300,
         energy_per_atom_tol: float = 10.0,
         max_force_tol: float = 50.0,
-        **kwargs,
+        incar: dict | None = None,
+        **extra,                         # absorb unknown keys from config
     ):
         self.name = name
-        self.calc_type = calc_type.lower()
+        self.calc_type = type.lower()
         self.fmax = fmax
         self.max_steps = max_steps
         self.energy_per_atom_tol = energy_per_atom_tol
         self.max_force_tol = max_force_tol
-        self.kwargs = kwargs  # INCAR overrides for VASP, etc.
+        self.incar = incar or {}
 
     def run(
         self,
@@ -60,26 +66,13 @@ class CalculatorStage:
         mace_device: str = "cpu",
     ) -> StageResult:
         """
-        Relax atoms with this stage's calculator.
+        Relax *atoms* with this stage's calculator.
 
-        Parameters
-        ----------
-        atoms : ASE Atoms object
-        struct_dir : Directory for outputs
-        mace_model : MACE model (small/medium/large)
-        mace_device : CPU or CUDA
-
-        Returns
-        -------
-        StageResult
+        Writes ``CONTCAR`` inside ``struct_dir/stage_{name}/``.
         """
-        struct_dir = Path(struct_dir)
-        struct_dir.mkdir(parents=True, exist_ok=True)
-
-        stage_dir = struct_dir / f"stage_{self.name}"
-        stage_dir.mkdir(exist_ok=True)
-
-        log.debug(f"  Running {self.name} in {stage_dir}")
+        stage_dir = Path(struct_dir) / f"stage_{self.name}"
+        stage_dir.mkdir(parents=True, exist_ok=True)
+        log.debug("Running %s in %s", self.name, stage_dir)
 
         try:
             if self.calc_type == "mace":
@@ -88,14 +81,11 @@ class CalculatorStage:
                 return self._run_vasp(atoms, stage_dir)
             else:
                 raise ValueError(f"Unknown calculator type: {self.calc_type}")
-        except Exception as e:
-            log.error(f"  {self.name} failed: {e}")
-            return StageResult(
-                converged=False,
-                energy=float("nan"),
-                n_steps=0,
-                trajectory_file=None,
-            )
+        except Exception as exc:
+            log.error("%s failed: %s", self.name, exc)
+            return StageResult(False, float("nan"), 0, None)
+
+    # -- MACE --------------------------------------------------------------
 
     def _run_mace(
         self,
@@ -104,118 +94,133 @@ class CalculatorStage:
         mace_model: str,
         mace_device: str,
     ) -> StageResult:
-        """Run MACE relaxation."""
+        """Relax with a MACE-MP foundation model."""
         try:
-            calc = MACE(
-                model=f"medium" if mace_model == "medium" else "small",
-                device=mace_device,
-                default_dtype="float32",
-            )
-        except Exception as e:
-            log.warning(f"  MACE init failed ({e}); trying default")
-            calc = MACE(model="small", device="cpu", default_dtype="float32")
+            from mace.calculators import mace_mp
+        except ImportError as exc:
+            raise ImportError(
+                "MACE-MP requires mace-torch.  Install with: pip install mace-torch"
+            ) from exc
 
-        atoms.set_calculator(calc)
+        calc = mace_mp(
+            model=mace_model,          # "small", "medium", or "large"
+            device=mace_device,
+            default_dtype="float32",
+        )
+        atoms = atoms.copy()
+        atoms.calc = calc
 
-        # Use strain filter for full cell relaxation
+        traj_path = stage_dir / "trajectory.traj"
+        log_path = stage_dir / "relax.log"
         dyn = BFGS(
             atoms,
-            trajectory=str(stage_dir / "trajectory.traj"),
-            logfile=str(stage_dir / "relax.log"),
+            trajectory=str(traj_path),
+            logfile=str(log_path),
         )
 
         try:
             converged = dyn.run(fmax=self.fmax, steps=self.max_steps)
-        except Exception as e:
-            log.warning(f"  MACE relax failed: {e}")
+        except Exception as exc:
+            log.warning("MACE relax failed: %s", exc)
             converged = False
 
         energy = float(atoms.get_potential_energy())
         n_steps = getattr(dyn, "nsteps", 0)
 
-        # Write CONTCAR for next stage
-        poscar = stage_dir / "CONTCAR"
-        try:
-            write(str(poscar), atoms, format="vasp")
-        except Exception as e:
-            log.warning(f"  Failed to write CONTCAR: {e}")
-
-        return StageResult(
-            converged=converged or n_steps > 0,
-            energy=energy,
-            n_steps=n_steps,
-            trajectory_file=str(stage_dir / "trajectory.traj"),
-        )
-
-    def _run_vasp(
-        self,
-        atoms: Atoms,
-        stage_dir: Path,
-    ) -> StageResult:
-        """Run VASP relaxation."""
-        incar = {
-            "ISMEAR": 0,
-            "SIGMA": 0.05,
-            "ALGO": "Fast",
-            "LREAL": "Auto",
-            "LWAVE": False,
-            "LCHARG": False,
-            "IBRION": 2,
-            "NSW": self.max_steps,
-            "EDIFFG": -self.fmax,
-            "EDIFF": 1e-5,
-        }
-        incar.update(self.kwargs)
-
-        try:
-            calc = Vasp(
-                directory=str(stage_dir),
-                **incar,
+        # Sanity check: unreasonable energy per atom → treat as failed
+        epa = abs(energy) / max(len(atoms), 1)
+        if epa > self.energy_per_atom_tol:
+            log.warning(
+                "%s energy/atom = %.2f eV — exceeds tolerance %.1f",
+                self.name, epa, self.energy_per_atom_tol,
             )
-        except Exception as e:
-            log.warning(f"  VASP init failed: {e}")
-            return StageResult(
-                converged=False,
-                energy=float("nan"),
-                n_steps=0,
-                trajectory_file=None,
-            )
-
-        atoms.set_calculator(calc)
-
-        try:
-            atoms.get_potential_energy()
-            converged = True
-        except Exception as e:
-            log.warning(f"  VASP run failed: {e}")
             converged = False
 
-        energy = float(atoms.get_potential_energy()) if converged else float("nan")
-        n_steps = 0  # Would need to parse OUTCAR for exact step count
-
-        # Read final geometry
-        contcar = stage_dir / "CONTCAR"
-        if contcar.exists():
-            try:
-                atoms = read(str(contcar), format="vasp")
-            except Exception as e:
-                log.warning(f"  Failed to read CONTCAR: {e}")
+        self._write_contcar(atoms, stage_dir)
 
         return StageResult(
             converged=converged,
             energy=energy,
             n_steps=n_steps,
+            trajectory_file=str(traj_path),
+        )
+
+    # -- VASP --------------------------------------------------------------
+
+    def _run_vasp(self, atoms: Atoms, stage_dir: Path) -> StageResult:
+        """Relax with VASP via ASE's Vasp calculator."""
+        from ase.calculators.vasp import Vasp
+
+        # ASE's Vasp calculator expects **lowercase** keyword arguments.
+        # The user-facing config may use uppercase INCAR keys, so we lower-case them.
+        vasp_kwargs: dict[str, object] = {
+            "ismear": 0,
+            "sigma": 0.05,
+            "algo": "Fast",
+            "lreal": "Auto",
+            "lwave": False,
+            "lcharg": False,
+            "ibrion": 2,
+            "nsw": self.max_steps,
+            "ediffg": -self.fmax,
+            "ediff": 1e-5,
+        }
+        for key, val in self.incar.items():
+            vasp_kwargs[key.lower()] = val
+
+        try:
+            calc = Vasp(directory=str(stage_dir), **vasp_kwargs)
+        except Exception as exc:
+            log.warning("VASP init failed: %s", exc)
+            return StageResult(False, float("nan"), 0, None)
+
+        atoms = atoms.copy()
+        atoms.calc = calc
+
+        try:
+            energy = float(atoms.get_potential_energy())
+            converged = True
+        except Exception as exc:
+            log.warning("VASP run failed: %s", exc)
+            energy = float("nan")
+            converged = False
+
+        # Read VASP-optimised geometry
+        contcar = stage_dir / "CONTCAR"
+        if contcar.exists():
+            try:
+                atoms = read(str(contcar), format="vasp")
+            except Exception as exc:
+                log.warning("Failed to read VASP CONTCAR: %s", exc)
+
+        return StageResult(
+            converged=converged,
+            energy=energy,
+            n_steps=0,   # would need OUTCAR parsing for exact count
             trajectory_file=None,
         )
 
+    # -- helpers -----------------------------------------------------------
+
+    @staticmethod
+    def _write_contcar(atoms: Atoms, stage_dir: Path) -> None:
+        try:
+            write(str(stage_dir / "CONTCAR"), atoms, format="vasp")
+        except Exception as exc:
+            log.warning("Failed to write CONTCAR: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Multi-stage pipeline
+# ---------------------------------------------------------------------------
 
 class Pipeline:
-    """Multi-stage relaxation pipeline."""
+    """Run a sequence of :class:`CalculatorStage` objects on one structure."""
 
     def __init__(self, stages: list[CalculatorStage]):
-        self.stages = stages
         if not stages:
             raise ValueError("Pipeline must have at least one stage")
+        self.stages = stages
 
     def run(
         self,
@@ -227,70 +232,60 @@ class Pipeline:
         """
         Run all stages sequentially.
 
-        Parameters
-        ----------
-        atoms : Starting geometry
-        struct_dir : Output directory
-        mace_model : MACE model size
-        mace_device : CPU or CUDA
-
         Returns
         -------
         dict with keys:
-            - converged: bool (all stages passed)
-            - final_energy: float
-            - stage_results: dict {stage_name: StageResult}
-            - final_atoms: ASE Atoms object
+            converged  — True only if **all** stages converged
+            final_energy — energy from the last stage
+            stage_results — {name: StageResult}
+            final_atoms — geometry after the last stage
         """
         struct_dir = Path(struct_dir)
         struct_dir.mkdir(parents=True, exist_ok=True)
 
         current_atoms = atoms.copy()
-        stage_results = {}
+        stage_results: dict[str, StageResult] = {}
         all_converged = True
 
         for stage in self.stages:
             result = stage.run(
-                current_atoms,
-                struct_dir,
-                mace_model=mace_model,
-                mace_device=mace_device,
+                current_atoms, struct_dir,
+                mace_model=mace_model, mace_device=mace_device,
             )
             stage_results[stage.name] = result
 
             if not result.converged:
                 all_converged = False
-                log.warning(f"  {stage.name} did not converge")
+                log.warning("%s did not converge", stage.name)
 
-            # Load output for next stage
-            stage_dir = struct_dir / f"stage_{stage.name}"
-            contcar = stage_dir / "CONTCAR"
+            # Load output geometry for next stage
+            contcar = struct_dir / f"stage_{stage.name}" / "CONTCAR"
             if contcar.exists():
                 try:
                     current_atoms = read(str(contcar), format="vasp")
-                except Exception as e:
-                    log.warning(f"  Failed to load {stage.name} output: {e}")
+                except Exception as exc:
+                    log.warning("Failed to load %s output: %s", stage.name, exc)
                     all_converged = False
                     break
             else:
-                log.warning(f"  No CONTCAR from {stage.name}")
+                log.warning("No CONTCAR from %s", stage.name)
                 all_converged = False
                 break
 
-        # Write final CONTCAR
+        # Write final outputs
         final_contcar = struct_dir / "CONTCAR"
         try:
             write(str(final_contcar), current_atoms, format="vasp")
-        except Exception as e:
-            log.warning(f"  Failed to write final CONTCAR: {e}")
+        except Exception as exc:
+            log.warning("Failed to write final CONTCAR: %s", exc)
 
-        # Write final energy
-        final_energy = stage_results[self.stages[-1].name].energy
+        last_stage_name = self.stages[-1].name
+        final_energy = stage_results[last_stage_name].energy
         energy_file = struct_dir / "FINAL_ENERGY"
         try:
             energy_file.write_text(f"{final_energy:.10f}\n")
-        except Exception as e:
-            log.warning(f"  Failed to write energy file: {e}")
+        except Exception as exc:
+            log.warning("Failed to write energy file: %s", exc)
 
         return {
             "converged": all_converged,
@@ -300,27 +295,16 @@ class Pipeline:
         }
 
 
+# ---------------------------------------------------------------------------
+# Builder
+# ---------------------------------------------------------------------------
+
 def build_pipeline(stage_configs: list) -> Pipeline:
     """
-    Build a Pipeline from config stage list.
-
-    Parameters
-    ----------
-    stage_configs : List of dicts with keys:
-        - name: str
-        - type: str ("mace" or "vasp")
-        - fmax: float
-        - max_steps: int
-        - incar: dict (VASP only)
-        - etc.
-
-    Returns
-    -------
-    Pipeline
+    Build a :class:`Pipeline` from a list of stage config dicts or Pydantic models.
     """
-    stages = []
+    stages: list[CalculatorStage] = []
     for cfg in stage_configs:
-        cfg_dict = dict(cfg) if hasattr(cfg, "items") else cfg.model_dump()
-        stage = CalculatorStage(**cfg_dict)
-        stages.append(stage)
+        d = cfg.model_dump() if hasattr(cfg, "model_dump") else dict(cfg)
+        stages.append(CalculatorStage(**d))
     return Pipeline(stages)

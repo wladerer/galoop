@@ -1,7 +1,7 @@
 """
-gocia/database.py
+galoop/database.py
 
-Lean SQLite interface. Single source of truth for structure state.
+SQLite interface.  Single source of truth for structure state.
 """
 
 from __future__ import annotations
@@ -17,23 +17,24 @@ import pandas as pd
 from galoop.individual import Individual, STATUS
 
 
+# ---------------------------------------------------------------------------
+# Encoding helpers
+# ---------------------------------------------------------------------------
+
 def _enc(value) -> str | None:
-    """Encode to JSON."""
     return None if value is None else json.dumps(value)
 
 
 def _dec_list(value) -> list:
-    """Decode from JSON."""
     return [] if not value else json.loads(value)
 
 
 def _dec_dict(value) -> dict:
-    """Decode from JSON."""
     return {} if not value else json.loads(value)
 
 
-def _row_to_individual(row: sqlite3.Row) -> Individual:
-    """Convert DB row to Individual."""
+def row_to_individual(row: sqlite3.Row) -> Individual:
+    """Convert a DB row to an Individual instance."""
     return Individual(
         id=row["id"],
         generation=row["generation"],
@@ -48,7 +49,11 @@ def _row_to_individual(row: sqlite3.Row) -> Individual:
     )
 
 
-_SCHEMA = """
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
+_SCHEMA = """\
 CREATE TABLE IF NOT EXISTS structures (
     id                      TEXT PRIMARY KEY,
     generation              INTEGER NOT NULL,
@@ -76,21 +81,26 @@ END;
 """
 
 
+# ---------------------------------------------------------------------------
+# Database class
+# ---------------------------------------------------------------------------
+
 class GaloopDB:
-    """SQLite database interface."""
+    """Thin wrapper around SQLite for structure bookkeeping."""
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._conn: sqlite3.Connection | None = None
 
+    # -- connection lifecycle ----------------------------------------------
+
     def connect(self) -> None:
-        """Open connection."""
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA foreign_keys = ON;")
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA foreign_keys=ON;")
 
     def close(self) -> None:
-        """Close connection."""
         if self._conn:
             self._conn.close()
             self._conn = None
@@ -103,128 +113,112 @@ class GaloopDB:
         self.close()
 
     @contextmanager
-    def transaction(self) -> Iterator[sqlite3.Cursor]:
-        """Context manager for transactions."""
-        conn = self._conn
-        if conn is None:
-            raise RuntimeError("Not connected.")
-        cur = conn.cursor()
+    def _tx(self) -> Iterator[sqlite3.Cursor]:
+        """Transaction context manager with auto-commit / rollback."""
+        assert self._conn is not None, "Database not connected"
+        cur = self._conn.cursor()
         try:
             yield cur
-            conn.commit()
+            self._conn.commit()
         except Exception:
-            conn.rollback()
+            self._conn.rollback()
             raise
 
+    # -- setup -------------------------------------------------------------
+
     def setup(self) -> None:
-        """Create tables."""
-        conn = self._conn
-        if conn is None:
-            raise RuntimeError("Not connected.")
-        for statement in _SCHEMA.split(";"):
-            if statement.strip():
-                conn.execute(statement)
-        conn.commit()
+        """Create tables and indices (idempotent)."""
+        assert self._conn is not None, "Database not connected"
+        self._conn.executescript(_SCHEMA)
+        self._conn.commit()
+
+    # -- CRUD --------------------------------------------------------------
 
     def insert(self, ind: Individual) -> str:
-        """Insert a new Individual."""
-        with self.transaction() as cur:
+        with self._tx() as cur:
             cur.execute(
-                """
-                INSERT INTO structures (
-                    id, generation, parent_ids, operator, status,
+                """INSERT INTO structures
+                   (id, generation, parent_ids, operator, status,
                     raw_energy, grand_canonical_energy, weight,
-                    geometry_path, extra_data
-                ) VALUES (
-                    :id, :gen, :parents, :op, :status,
-                    :raw_e, :gce, :weight,
-                    :geom, :extra
-                )
-                """,
-                {
-                    "id": ind.id,
-                    "gen": ind.generation,
-                    "parents": _enc(ind.parent_ids),
-                    "op": ind.operator,
-                    "status": ind.status,
-                    "raw_e": ind.raw_energy,
-                    "gce": ind.grand_canonical_energy,
-                    "weight": ind.weight,
-                    "geom": ind.geometry_path,
-                    "extra": _enc(ind.extra_data),
-                },
+                    geometry_path, extra_data)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ind.id,
+                    ind.generation,
+                    _enc(ind.parent_ids),
+                    ind.operator,
+                    ind.status,
+                    ind.raw_energy,
+                    ind.grand_canonical_energy,
+                    ind.weight,
+                    ind.geometry_path,
+                    _enc(ind.extra_data),
+                ),
             )
         return ind.id
 
     def update(self, ind: Individual) -> None:
-        """Update an existing Individual."""
-        with self.transaction() as cur:
+        with self._tx() as cur:
             cur.execute(
-                """
-                UPDATE structures SET
-                    status                 = :status,
-                    raw_energy             = :raw_e,
-                    grand_canonical_energy = :gce,
-                    weight                 = :weight,
-                    geometry_path          = :geom,
-                    extra_data             = :extra
-                WHERE id = :id
-                """,
-                {
-                    "id": ind.id,
-                    "status": ind.status,
-                    "raw_e": ind.raw_energy,
-                    "gce": ind.grand_canonical_energy,
-                    "weight": ind.weight,
-                    "geom": ind.geometry_path,
-                    "extra": _enc(ind.extra_data),
-                },
+                """UPDATE structures SET
+                       status=?, raw_energy=?, grand_canonical_energy=?,
+                       weight=?, geometry_path=?, extra_data=?
+                   WHERE id=?""",
+                (
+                    ind.status,
+                    ind.raw_energy,
+                    ind.grand_canonical_energy,
+                    ind.weight,
+                    ind.geometry_path,
+                    _enc(ind.extra_data),
+                    ind.id,
+                ),
             )
 
     def get(self, ind_id: str) -> Individual | None:
-        """Fetch a single Individual by id."""
         row = self._conn.execute(
-            "SELECT * FROM structures WHERE id = ?", (ind_id,)
+            "SELECT * FROM structures WHERE id=?", (ind_id,)
         ).fetchone()
-        return _row_to_individual(row) if row else None
+        return row_to_individual(row) if row else None
 
     def get_by_status(self, status: str) -> list[Individual]:
-        """Get all Individuals with a given status."""
         rows = self._conn.execute(
-            "SELECT * FROM structures WHERE status = ?", (status,)
+            "SELECT * FROM structures WHERE status=?", (status,)
         ).fetchall()
-        return [_row_to_individual(r) for r in rows]
+        return [row_to_individual(r) for r in rows]
 
     def selectable_pool(self) -> list[Individual]:
-        """Get all Individuals eligible for selection (converged, weight > 0)."""
+        """Converged structures with weight > 0 (eligible for parent selection)."""
         rows = self._conn.execute(
-            "SELECT * FROM structures WHERE status = ? AND weight > 0",
+            "SELECT * FROM structures WHERE status=? AND weight>0",
             (STATUS.CONVERGED,),
         ).fetchall()
-        return [_row_to_individual(r) for r in rows]
+        return [row_to_individual(r) for r in rows]
 
     def best(self, n: int = 10) -> list[Individual]:
-        """Get top-n Individuals by grand canonical energy."""
         rows = self._conn.execute(
-            """
-            SELECT * FROM structures
-            WHERE status = ? AND grand_canonical_energy IS NOT NULL
-            ORDER BY grand_canonical_energy ASC
-            LIMIT ?
-            """,
+            """SELECT * FROM structures
+               WHERE status=? AND grand_canonical_energy IS NOT NULL
+               ORDER BY grand_canonical_energy ASC LIMIT ?""",
             (STATUS.CONVERGED, n),
         ).fetchall()
-        return [_row_to_individual(r) for r in rows]
+        return [row_to_individual(r) for r in rows]
 
     def count_by_status(self) -> dict[str, int]:
-        """Count structures by status."""
         rows = self._conn.execute(
-            "SELECT status, COUNT(*) as n FROM structures GROUP BY status"
+            "SELECT status, COUNT(*) AS n FROM structures GROUP BY status"
         ).fetchall()
         return {row["status"]: row["n"] for row in rows}
 
+    def find_by_geometry_path_substring(self, substr: str) -> Individual | None:
+        """Find the first Individual whose geometry_path contains *substr*."""
+        row = self._conn.execute(
+            "SELECT * FROM structures WHERE geometry_path LIKE ? LIMIT 1",
+            (f"%{substr}%",),
+        ).fetchone()
+        return row_to_individual(row) if row else None
+
     def to_dataframe(self) -> pd.DataFrame:
-        """Export to pandas DataFrame."""
         df = pd.read_sql_query(
             "SELECT * FROM structures ORDER BY generation, rowid",
             self._conn,

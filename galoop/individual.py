@@ -1,7 +1,7 @@
 """
-gocia/individual.py
+galoop/individual.py
 
-Simplified Individual model — minimal fields, clear semantics.
+Minimal Individual data model for the GA.
 """
 
 from __future__ import annotations
@@ -12,8 +12,13 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 class STATUS:
-    """Status constants for the structure lifecycle."""
+    """Structure lifecycle states."""
+
     PENDING = "pending"
     SUBMITTED = "submitted"
     CONVERGED = "converged"
@@ -21,17 +26,21 @@ class STATUS:
     DUPLICATE = "duplicate"
     DESORBED = "desorbed"
 
-    @staticmethod
-    def is_terminal(status: str) -> bool:
-        return status in {STATUS.CONVERGED, STATUS.FAILED, STATUS.DUPLICATE, STATUS.DESORBED}
+    _TERMINAL = frozenset({"converged", "failed", "duplicate", "desorbed"})
+    _ACTIVE = frozenset({"pending", "submitted"})
 
     @staticmethod
-    def is_running_or_submitted(status: str) -> bool:
-        return status in {STATUS.SUBMITTED, STATUS.PENDING}
+    def is_terminal(status: str) -> bool:
+        return status in STATUS._TERMINAL
+
+    @staticmethod
+    def is_active(status: str) -> bool:
+        return status in STATUS._ACTIVE
 
 
 class OPERATOR:
-    """Operator constants."""
+    """GA operator labels."""
+
     INIT = "init"
     SPLICE = "splice"
     MERGE = "merge"
@@ -40,22 +49,35 @@ class OPERATOR:
     MUTATE_DISPLACE = "mutate_displace"
 
 
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
+
+def _short_uuid() -> str:
+    return str(uuid.uuid4())[:8]
+
+
 class Individual(BaseModel):
     """
-    A single structure in the GA.
+    A single candidate structure in the GA population.
 
-    Minimal fields:
-    - id, generation, parents, operator: genealogy
-    - status: pipeline state
-    - raw_energy, grand_canonical_energy: fitness
-    - weight: selection weight (1.0 or 0.0 for duplicates)
-    - geometry_path: where the CONTCAR lives
-    - extra_data: adsorbate counts, stage energies, etc.
+    Fields
+    ------
+    id : 8-char UUID fragment
+    generation : which generation this structure belongs to
+    parent_ids : IDs of parent structures (empty for initial population)
+    operator : which GA operator produced this structure
+    status : current lifecycle state
+    raw_energy : DFT total energy (eV), set after relaxation
+    grand_canonical_energy : CHE-corrected fitness (eV)
+    weight : selection weight (0.0 for duplicates, 1.0 otherwise)
+    geometry_path : filesystem path to POSCAR/CONTCAR
+    extra_data : adsorbate counts, stage energies, notes
     """
 
     model_config = {"frozen": False}
 
-    id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8])
+    id: str = Field(default_factory=_short_uuid)
     generation: int = 0
     parent_ids: list[str] = Field(default_factory=list)
     operator: str = OPERATOR.INIT
@@ -68,6 +90,8 @@ class Individual(BaseModel):
     geometry_path: str | None = None
     extra_data: dict[str, Any] = Field(default_factory=dict)
 
+    # -- factory methods ---------------------------------------------------
+
     @classmethod
     def from_init(
         cls,
@@ -75,7 +99,7 @@ class Individual(BaseModel):
         geometry_path: str | None = None,
         extra_data: dict | None = None,
     ) -> Individual:
-        """Create a fresh structure for the initial population."""
+        """Create a structure for the initial random population."""
         return cls(
             generation=generation,
             operator=OPERATOR.INIT,
@@ -93,7 +117,7 @@ class Individual(BaseModel):
         geometry_path: str | None = None,
         extra_data: dict | None = None,
     ) -> Individual:
-        """Create a structure from parent(s)."""
+        """Create an offspring from one or more parents."""
         return cls(
             generation=generation,
             parent_ids=[p.id for p in parents],
@@ -103,35 +127,37 @@ class Individual(BaseModel):
             extra_data=extra_data or {},
         )
 
+    # -- immutable update helpers ------------------------------------------
+
     def with_status(self, status: str) -> Individual:
-        """Return a copy with new status."""
+        """Return a copy with a new status."""
         copy = self.model_copy()
         copy.status = status
         return copy
 
     def with_energy(self, raw: float, grand_canonical: float) -> Individual:
-        """Return a copy with new energies."""
+        """Return a copy with energies set."""
         copy = self.model_copy()
         copy.raw_energy = raw
         copy.grand_canonical_energy = grand_canonical
         return copy
 
     def with_weight(self, weight: float) -> Individual:
-        """Return a copy with new weight."""
         copy = self.model_copy()
         copy.weight = weight
         return copy
 
     def mark_duplicate(self) -> Individual:
-        """Mark as duplicate, zero weight."""
+        """Return a copy marked as duplicate with zero selection weight."""
         copy = self.model_copy()
         copy.status = STATUS.DUPLICATE
         copy.weight = 0.0
         return copy
 
+    # -- predicates --------------------------------------------------------
+
     @property
     def is_selectable(self) -> bool:
-        """Can this structure be selected as a parent?"""
         return self.status == STATUS.CONVERGED and self.weight > 0
 
     @property

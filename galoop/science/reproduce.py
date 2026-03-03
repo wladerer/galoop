@@ -1,7 +1,7 @@
 """
-gocia/science/reproduce.py
+galoop/science/reproduce.py
 
-GA operators: splice, merge, add/remove/displace mutations.
+GA operators: splice, merge, add / remove / displace mutations.
 """
 
 from __future__ import annotations
@@ -12,325 +12,209 @@ from typing import Tuple
 import numpy as np
 from ase import Atoms
 from ase.constraints import FixAtoms
-from ase.geometry import get_distances
 
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Crossover: splice
+# ---------------------------------------------------------------------------
+
 def splice(
-    slab_a: Atoms,
-    slab_b: Atoms,
-    n_slab_atoms: int,
+    parent_a: Atoms,
+    parent_b: Atoms,
+    n_slab: int,
     rng: np.random.Generator | None = None,
 ) -> Tuple[Atoms, Atoms]:
     """
-    Splice: cut both structures at random Z, keep bottom from A, top from B.
+    Z-cut splice: keep slab + low adsorbates from A, high from B (and vice
+    versa).
 
-    Parameters
-    ----------
-    slab_a : Parent A
-    slab_b : Parent B
-    n_slab_atoms : Number of fixed slab atoms
-    rng : Random generator
-
-    Returns
-    -------
-    (child1, child2) : Two children (B-top on A-slab, A-top on B-slab)
+    Returns two children.  If either parent has no adsorbates the
+    corresponding child is a plain copy.
     """
-    if rng is None:
-        rng = np.random.default_rng()
+    rng = rng or np.random.default_rng()
 
-    # Get adsorbate regions (everything above slab)
-    pos_a = slab_a.get_positions()
-    pos_b = slab_b.get_positions()
-
-    ads_a = pos_a[n_slab_atoms:]
-    ads_b = pos_b[n_slab_atoms:]
+    pos_a = parent_a.get_positions()
+    pos_b = parent_b.get_positions()
+    ads_a = pos_a[n_slab:]
+    ads_b = pos_b[n_slab:]
+    sym_a = parent_a.get_chemical_symbols()
+    sym_b = parent_b.get_chemical_symbols()
 
     if len(ads_a) == 0 or len(ads_b) == 0:
-        # No adsorbates; return copies
-        return slab_a.copy(), slab_b.copy()
+        return parent_a.copy(), parent_b.copy()
 
-    # Find cutting plane (Z coordinate)
-    z_cut = rng.uniform(
-        min(np.min(ads_a[:, 2]), np.min(ads_b[:, 2])),
-        max(np.max(ads_a[:, 2]), np.max(ads_b[:, 2])),
+    z_lo = min(np.min(ads_a[:, 2]), np.min(ads_b[:, 2]))
+    z_hi = max(np.max(ads_a[:, 2]), np.max(ads_b[:, 2]))
+    z_cut = rng.uniform(z_lo, z_hi)
+
+    def _build_child(base: Atoms, keep_below, donor_above_pos, donor_above_sym):
+        child = Atoms(
+            symbols=base.get_chemical_symbols()[:n_slab],
+            positions=base.get_positions()[:n_slab],
+            cell=base.get_cell(),
+            pbc=base.get_pbc(),
+        )
+        child.set_constraint(FixAtoms(indices=list(range(n_slab))))
+        # Low adsorbates from base
+        for idx in np.where(keep_below)[0]:
+            child.append(Atoms(base.get_chemical_symbols()[n_slab + idx],
+                               positions=[base.get_positions()[n_slab + idx]]))
+        # High adsorbates from donor
+        for pos, sym in zip(donor_above_pos, donor_above_sym):
+            child.append(Atoms(sym, positions=[pos]))
+        return child
+
+    mask_a_low = ads_a[:, 2] < z_cut
+    mask_b_high = ads_b[:, 2] >= z_cut
+    mask_b_low = ads_b[:, 2] < z_cut
+    mask_a_high = ads_a[:, 2] >= z_cut
+
+    child1 = _build_child(
+        parent_a, mask_a_low,
+        ads_b[mask_b_high], [sym_b[n_slab + i] for i in np.where(mask_b_high)[0]],
     )
-
-    # Splice: keep slab + bottom adsorbates from A, top adsorbates from B
-    mask_a_keep = ads_a[:, 2] < z_cut
-    mask_b_keep = ads_b[:, 2] >= z_cut
-
-    child1 = slab_a.copy()
-    child1.set_constraint(FixAtoms(indices=range(n_slab_atoms)))
-
-    child2 = slab_b.copy()
-    child2.set_constraint(FixAtoms(indices=range(n_slab_atoms)))
-
-    # Build child1: slab_a + ads_a[below] + ads_b[above]
-    atoms_to_add_1 = []
-    positions_to_add_1 = []
-    if np.any(mask_b_keep):
-        symbols_b_top = [slab_b.get_chemical_symbols()[n_slab_atoms + i] 
-                         for i in np.where(mask_b_keep)[0]]
-        positions_b_top = ads_b[mask_b_keep]
-        atoms_to_add_1.extend(symbols_b_top)
-        positions_to_add_1.extend(positions_b_top)
-
-    if atoms_to_add_1:
-        child1.extend(Atoms(symbols=atoms_to_add_1, positions=positions_to_add_1))
-
-    # Build child2: slab_b + ads_b[below] + ads_a[above]
-    atoms_to_add_2 = []
-    positions_to_add_2 = []
-    if np.any(mask_a_keep):
-        symbols_a_top = [slab_a.get_chemical_symbols()[n_slab_atoms + i] 
-                         for i in np.where(mask_a_keep)[0]]
-        positions_a_top = ads_a[mask_a_keep]
-        atoms_to_add_2.extend(symbols_a_top)
-        positions_to_add_2.extend(positions_a_top)
-
-    if atoms_to_add_2:
-        child2.extend(Atoms(symbols=atoms_to_add_2, positions=positions_to_add_2))
-
+    child2 = _build_child(
+        parent_b, mask_b_low,
+        ads_a[mask_a_high], [sym_a[n_slab + i] for i in np.where(mask_a_high)[0]],
+    )
     return child1, child2
 
 
+# ---------------------------------------------------------------------------
+# Crossover: merge
+# ---------------------------------------------------------------------------
+
 def merge(
-    slab_a: Atoms,
-    slab_b: Atoms,
-    n_slab_atoms: int,
+    parent_a: Atoms,
+    parent_b: Atoms,
+    n_slab: int,
     rng: np.random.Generator | None = None,
 ) -> Atoms:
-    """
-    Merge: combine adsorbates from both parents.
+    """Combine adsorbates from both parents onto A's slab."""
+    child = parent_a.copy()
+    child.set_constraint(FixAtoms(indices=list(range(n_slab))))
 
-    Parameters
-    ----------
-    slab_a : Parent A
-    slab_b : Parent B
-    n_slab_atoms : Number of fixed slab atoms
-    rng : Random generator
+    ads_pos = parent_b.get_positions()[n_slab:]
+    ads_sym = parent_b.get_chemical_symbols()[n_slab:]
 
-    Returns
-    -------
-    Atoms : Child with combined adsorbates
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    child = slab_a.copy()
-    child.set_constraint(FixAtoms(indices=range(n_slab_atoms)))
-
-    # Get adsorbates from B
-    pos_b = slab_b.get_positions()
-    ads_b = pos_b[n_slab_atoms:]
-    symbols_b_ads = slab_b.get_chemical_symbols()[n_slab_atoms:]
-
-    if len(ads_b) > 0:
-        # Add B's adsorbates to A's slab
-        ads_atoms = Atoms(symbols=symbols_b_ads, positions=ads_b)
-        child.extend(ads_atoms)
-
+    if len(ads_pos) > 0:
+        child.extend(Atoms(symbols=ads_sym, positions=ads_pos))
     return child
 
 
+# ---------------------------------------------------------------------------
+# Mutations
+# ---------------------------------------------------------------------------
+
 def mutate_add(
     atoms: Atoms,
-    n_slab_atoms: int,
+    n_slab: int,
     symbol: str,
     position: np.ndarray | None = None,
     rng: np.random.Generator | None = None,
 ) -> Atoms:
-    """
-    Add a single atom to the structure.
-
-    Parameters
-    ----------
-    atoms : Structure to mutate
-    n_slab_atoms : Number of fixed slab atoms
-    symbol : Element to add
-    position : Position for new atom; random if None
-    rng : Random generator
-
-    Returns
-    -------
-    Atoms : Mutated structure
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
+    """Add one atom of *symbol* at a random position above the slab."""
+    rng = rng or np.random.default_rng()
     child = atoms.copy()
-    child.set_constraint(FixAtoms(indices=range(n_slab_atoms)))
+    child.set_constraint(FixAtoms(indices=list(range(n_slab))))
 
     if position is None:
-        # Random position above slab
-        positions = atoms.get_positions()
-        z_max = np.max(positions[n_slab_atoms:, 2]) if len(atoms) > n_slab_atoms else np.max(positions[:, 2])
+        pos = atoms.get_positions()
+        z_top = np.max(pos[:, 2])
         cell = atoms.get_cell()
-
         xy = rng.uniform(0, 1, size=2) @ cell[:2, :2]
-        z = rng.uniform(z_max + 1.0, z_max + 5.0)
+        z = rng.uniform(z_top + 1.0, z_top + 4.0)
         position = np.array([xy[0], xy[1], z])
 
-    new_atom = Atoms(symbol=symbol, positions=[position])
-    child.extend(new_atom)
-
+    child.extend(Atoms(symbols=[symbol], positions=[position]))
     return child
 
 
 def mutate_remove(
     atoms: Atoms,
-    n_slab_atoms: int,
+    n_slab: int,
     symbol: str | None = None,
     rng: np.random.Generator | None = None,
 ) -> Atoms | None:
-    """
-    Remove an adsorbate atom from the structure.
+    """Remove one random adsorbate atom.  Returns ``None`` if nothing to remove."""
+    rng = rng or np.random.default_rng()
+    if len(atoms) <= n_slab:
+        return None
 
-    Parameters
-    ----------
-    atoms : Structure to mutate
-    n_slab_atoms : Number of fixed slab atoms
-    symbol : Element to remove; random if None
-    rng : Random generator
-
-    Returns
-    -------
-    Atoms : Mutated structure, or None if no adsorbates to remove
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    if len(atoms) <= n_slab_atoms:
-        return None  # No adsorbates to remove
-
-    # Pick an adsorbate to remove
-    ads_indices = list(range(n_slab_atoms, len(atoms)))
-    symbols_ads = [atoms.get_chemical_symbols()[i] for i in ads_indices]
-
+    ads_indices = list(range(n_slab, len(atoms)))
     if symbol:
-        # Remove a specific element
-        candidates = [i for i, s in zip(ads_indices, symbols_ads) if s == symbol]
-        if not candidates:
+        syms = atoms.get_chemical_symbols()
+        ads_indices = [i for i in ads_indices if syms[i] == symbol]
+        if not ads_indices:
             return None
-        idx_to_remove = rng.choice(candidates)
-    else:
-        # Remove any adsorbate atom
-        idx_to_remove = rng.choice(ads_indices)
 
-    del atoms[idx_to_remove]
-    return atoms
+    idx = int(rng.choice(ads_indices))
+    child = atoms.copy()
+    del child[idx]
+    return child
 
 
 def mutate_displace(
     atoms: Atoms,
-    n_slab_atoms: int,
+    n_slab: int,
     symbol: str | None = None,
     displacement: float = 0.5,
     rng: np.random.Generator | None = None,
 ) -> Atoms | None:
-    """
-    Displace an adsorbate atom randomly.
-
-    Parameters
-    ----------
-    atoms : Structure to mutate
-    n_slab_atoms : Number of fixed slab atoms
-    symbol : Element to displace; random if None
-    displacement : Max displacement (Å)
-    rng : Random generator
-
-    Returns
-    -------
-    Atoms : Mutated structure, or None if no adsorbates
-    """
-    if rng is None:
-        rng = np.random.default_rng()
-
-    if len(atoms) <= n_slab_atoms:
+    """Randomly displace one adsorbate atom.  Returns ``None`` if no adsorbates."""
+    rng = rng or np.random.default_rng()
+    if len(atoms) <= n_slab:
         return None
 
     child = atoms.copy()
-    child.set_constraint(FixAtoms(indices=range(n_slab_atoms)))
+    child.set_constraint(FixAtoms(indices=list(range(n_slab))))
 
-    # Pick an adsorbate
-    ads_indices = list(range(n_slab_atoms, len(atoms)))
-    symbols_ads = [child.get_chemical_symbols()[i] for i in ads_indices]
-
+    ads_indices = list(range(n_slab, len(atoms)))
     if symbol:
-        candidates = [i for i, s in zip(ads_indices, symbols_ads) if s == symbol]
-        if not candidates:
+        syms = child.get_chemical_symbols()
+        ads_indices = [i for i in ads_indices if syms[i] == symbol]
+        if not ads_indices:
             return None
-        idx_to_move = rng.choice(candidates)
-    else:
-        idx_to_move = rng.choice(ads_indices)
 
-    # Random displacement
+    idx = int(rng.choice(ads_indices))
     delta = rng.normal(0, displacement / 3, size=3)
     pos = child.get_positions()
-    pos[idx_to_move] += delta
+    pos[idx] += delta
     child.set_positions(pos)
-
     return child
 
+
+# ---------------------------------------------------------------------------
+# Dispatchers
+# ---------------------------------------------------------------------------
 
 def crossover_operator(
     parent_a: Atoms,
     parent_b: Atoms,
-    n_slab_atoms: int,
+    n_slab: int,
     operator_type: str = "splice",
     rng: np.random.Generator | None = None,
 ) -> Atoms | Tuple[Atoms, Atoms]:
-    """
-    Generic crossover operator dispatcher.
-
-    Parameters
-    ----------
-    parent_a, parent_b : Parents
-    n_slab_atoms : Slab atoms
-    operator_type : "splice" or "merge"
-    rng : Random generator
-
-    Returns
-    -------
-    Atoms or (Atoms, Atoms) depending on operator
-    """
-    if operator_type.lower() == "splice":
-        return splice(parent_a, parent_b, n_slab_atoms, rng)
-    elif operator_type.lower() == "merge":
-        return merge(parent_a, parent_b, n_slab_atoms, rng)
-    else:
-        raise ValueError(f"Unknown crossover operator: {operator_type}")
+    if operator_type == "splice":
+        return splice(parent_a, parent_b, n_slab, rng)
+    elif operator_type == "merge":
+        return merge(parent_a, parent_b, n_slab, rng)
+    raise ValueError(f"Unknown crossover operator: {operator_type}")
 
 
 def mutation_operator(
     atoms: Atoms,
-    n_slab_atoms: int,
+    n_slab: int,
     operator_type: str = "displace",
     symbol: str | None = None,
     rng: np.random.Generator | None = None,
 ) -> Atoms | None:
-    """
-    Generic mutation operator dispatcher.
-
-    Parameters
-    ----------
-    atoms : Structure to mutate
-    n_slab_atoms : Slab atoms
-    operator_type : "add", "remove", "displace"
-    symbol : Element (for add/remove/displace)
-    rng : Random generator
-
-    Returns
-    -------
-    Atoms : Mutated structure, or None if mutation not possible
-    """
-    if operator_type.lower() == "add":
-        return mutate_add(atoms, n_slab_atoms, symbol or "H", rng=rng)
-    elif operator_type.lower() == "remove":
-        return mutate_remove(atoms, n_slab_atoms, symbol, rng=rng)
-    elif operator_type.lower() == "displace":
-        return mutate_displace(atoms, n_slab_atoms, symbol, rng=rng)
-    else:
-        raise ValueError(f"Unknown mutation operator: {operator_type}")
+    if operator_type == "add":
+        return mutate_add(atoms, n_slab, symbol or "H", rng=rng)
+    elif operator_type == "remove":
+        return mutate_remove(atoms, n_slab, symbol, rng=rng)
+    elif operator_type == "displace":
+        return mutate_displace(atoms, n_slab, symbol, rng=rng)
+    raise ValueError(f"Unknown mutation operator: {operator_type}")

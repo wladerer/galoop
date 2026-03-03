@@ -1,5 +1,5 @@
 """
-gocia/cli.py
+galoop/cli.py
 
 Command-line interface.
 """
@@ -17,10 +17,9 @@ from galoop.galoop import run as run_ga
 
 
 @click.group()
-@click.version_option()
+@click.version_option(version="0.1.0")
 def cli():
     """galoop — lean genetic algorithm for adsorbate structure search."""
-    pass
 
 
 @cli.command()
@@ -28,7 +27,7 @@ def cli():
 @click.option("--run-dir", "-d", default=".", type=click.Path())
 @click.option("--seed", type=int, default=None)
 @click.option("--verbose", "-v", is_flag=True)
-def run(config: str, run_dir: str, seed: int, verbose: bool):
+def run(config: str, run_dir: str, seed: int | None, verbose: bool):
     """Start or resume the GA loop."""
     logging.basicConfig(
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -43,14 +42,13 @@ def run(config: str, run_dir: str, seed: int, verbose: bool):
 
     try:
         cfg = load_config(config_path)
-    except Exception as e:
-        log.error(f"Config validation failed: {e}")
+    except Exception as exc:
+        log.error("Config validation failed: %s", exc)
         sys.exit(1)
 
-    # Import here to avoid circular deps
-    from gocia.engine.calculator import build_pipeline
-    from gocia.engine.scheduler import build_scheduler
-    from gocia.science.surface import load_slab
+    from galoop.engine.calculator import build_pipeline
+    from galoop.engine.scheduler import build_scheduler
+    from galoop.science.surface import load_slab
 
     try:
         slab_info = load_slab(
@@ -58,16 +56,16 @@ def run(config: str, run_dir: str, seed: int, verbose: bool):
             zmin=cfg.slab.sampling_zmin,
             zmax=cfg.slab.sampling_zmax,
         )
-        stages = build_pipeline(cfg.calculator_stages)
+        pipeline = build_pipeline(cfg.calculator_stages)
         scheduler = build_scheduler(cfg.scheduler)
 
         with GaloopDB(run_dir_path / "galoop.db") as db:
             db.setup()
 
         rng = np.random.default_rng(seed)
-        run_ga(cfg, run_dir_path, slab_info, stages, scheduler, rng)
+        run_ga(cfg, run_dir_path, slab_info, pipeline, scheduler, rng)
 
-    except Exception as e:
+    except Exception:
         log.exception("Fatal error in GA loop")
         sys.exit(1)
 
@@ -76,8 +74,7 @@ def run(config: str, run_dir: str, seed: int, verbose: bool):
 @click.option("--run-dir", "-d", default=".", type=click.Path())
 def status(run_dir: str):
     """Print run status."""
-    run_dir_path = Path(run_dir)
-    db_path = run_dir_path / "galoop.db"
+    db_path = Path(run_dir) / "galoop.db"
 
     if not db_path.exists():
         click.echo(f"No database at {db_path}", err=True)
@@ -86,14 +83,14 @@ def status(run_dir: str):
     with GaloopDB(db_path) as db:
         counts = db.count_by_status()
         click.echo("\nStructure counts by status:")
-        for status, n in sorted(counts.items()):
-            click.echo(f"  {status:<20} {n}")
+        for st, n in sorted(counts.items()):
+            click.echo(f"  {st:<20} {n}")
 
         best = db.best(n=5)
         if best:
             click.echo("\nTop 5 structures:")
             for i, ind in enumerate(best, 1):
-                g = f"{ind.grand_canonical_energy:.4f}" if ind.grand_canonical_energy else "N/A"
+                g = f"{ind.grand_canonical_energy:.4f}" if ind.grand_canonical_energy is not None else "N/A"
                 click.echo(f"  {i}. gen={ind.generation}  G={g} eV  {ind.id}")
 
 

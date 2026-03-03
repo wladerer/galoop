@@ -1,8 +1,7 @@
 """
-gocia/engine/scheduler.py
+galoop/engine/scheduler.py
 
 Job scheduler abstraction: local, SLURM, PBS.
-Submits jobs, polls status, retrieves results.
 """
 
 from __future__ import annotations
@@ -13,13 +12,15 @@ import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
 
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Status enum
+# ---------------------------------------------------------------------------
+
 class JobStatus(Enum):
-    """Job execution status."""
     PENDING = "pending"
     RUNNING = "running"
     DONE = "done"
@@ -27,69 +28,46 @@ class JobStatus(Enum):
     UNKNOWN = "unknown"
 
 
-class JobInfo(NamedTuple):
-    """Job status information."""
-    job_id: str
-    status: JobStatus
-    exit_code: int | None
-
+# ---------------------------------------------------------------------------
+# Abstract base
+# ---------------------------------------------------------------------------
 
 class Scheduler(ABC):
-    """Base scheduler interface."""
+    """Interface that all schedulers must implement."""
+
+    nworkers: int
 
     @abstractmethod
     def submit(self, job_name: str, script: str, workdir: Path) -> str:
-        """
-        Submit a job.
-
-        Parameters
-        ----------
-        job_name : Job identifier
-        script : Shell script to run
-        workdir : Working directory (cwd for job)
-
-        Returns
-        -------
-        str : Job ID
-        """
-        pass
+        """Submit *script* and return a job ID string."""
+        ...
 
     @abstractmethod
     def status(self, job_ids: list[str]) -> dict[str, JobStatus]:
-        """
-        Get status of jobs.
-
-        Parameters
-        ----------
-        job_ids : List of job IDs
-
-        Returns
-        -------
-        dict : {job_id: JobStatus}
-        """
-        pass
+        """Poll statuses for a batch of job IDs."""
+        ...
 
     @abstractmethod
     def cancel(self, job_id: str) -> bool:
-        """Cancel a job."""
-        pass
+        """Attempt to cancel a job.  Return True on success."""
+        ...
 
+
+# ---------------------------------------------------------------------------
+# Local (subprocess) scheduler
+# ---------------------------------------------------------------------------
 
 class LocalScheduler(Scheduler):
-    """
-    Local (non-HPC) scheduler.
-    Spawns processes via subprocess; no actual job queuing.
-    """
+    """Run jobs as local sub-processes — no HPC queue needed."""
 
     def __init__(self, nworkers: int = 4):
         self.nworkers = nworkers
-        self.jobs = {}  # {job_id: (process, start_time)}
-        self.next_job_id = 0
+        self._jobs: dict[str, tuple[subprocess.Popen, float]] = {}
+        self._next_id = 0
 
     def submit(self, job_name: str, script: str, workdir: Path) -> str:
-        """Submit a local job."""
-        job_id = f"local_{self.next_job_id:06d}"
-        self.next_job_id += 1
+        job_id = f"local_{self._next_id:06d}"
+        self._next_id += 1
 
         workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
@@ -98,57 +76,51 @@ class LocalScheduler(Scheduler):
         script_file.write_text(f"#!/bin/bash\nset -e\n{script}\n")
         script_file.chmod(0o755)
 
-        try:
-            proc = subprocess.Popen(
-                ["bash", str(script_file)],
-                cwd=str(workdir),
-                stdout=open(workdir / "stdout.txt", "w"),
-                stderr=open(workdir / "stderr.txt", "w"),
-            )
-            self.jobs[job_id] = (proc, time.time())
-            log.info(f"  Submitted local job {job_id} (PID {proc.pid})")
-            return job_id
-        except Exception as e:
-            log.error(f"  Failed to submit job: {e}")
-            raise
+        proc = subprocess.Popen(
+            ["bash", str(script_file)],
+            cwd=str(workdir),
+            stdout=open(workdir / "stdout.txt", "w"),
+            stderr=open(workdir / "stderr.txt", "w"),
+        )
+        self._jobs[job_id] = (proc, time.time())
+        log.info("Submitted local job %s (PID %d)", job_id, proc.pid)
+        return job_id
 
     def status(self, job_ids: list[str]) -> dict[str, JobStatus]:
-        """Poll job statuses."""
-        result = {}
-        for job_id in job_ids:
-            if job_id not in self.jobs:
-                result[job_id] = JobStatus.UNKNOWN
+        result: dict[str, JobStatus] = {}
+        for jid in job_ids:
+            if jid not in self._jobs:
+                result[jid] = JobStatus.UNKNOWN
                 continue
-
-            proc, _ = self.jobs[job_id]
-            poll = proc.poll()
-
-            if poll is None:
-                result[job_id] = JobStatus.RUNNING
-            elif poll == 0:
-                result[job_id] = JobStatus.DONE
-                del self.jobs[job_id]
+            proc, _ = self._jobs[jid]
+            rc = proc.poll()
+            if rc is None:
+                result[jid] = JobStatus.RUNNING
+            elif rc == 0:
+                result[jid] = JobStatus.DONE
+                del self._jobs[jid]
             else:
-                result[job_id] = JobStatus.FAILED
-                del self.jobs[job_id]
-
+                result[jid] = JobStatus.FAILED
+                del self._jobs[jid]
         return result
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a local job."""
-        if job_id not in self.jobs:
+        if job_id not in self._jobs:
             return False
-        proc, _ = self.jobs[job_id]
+        proc, _ = self._jobs[job_id]
         try:
             proc.terminate()
-            del self.jobs[job_id]
+            del self._jobs[job_id]
             return True
         except Exception:
             return False
 
 
+# ---------------------------------------------------------------------------
+# SLURM
+# ---------------------------------------------------------------------------
+
 class SlurmScheduler(Scheduler):
-    """SLURM job scheduler."""
 
     def __init__(
         self,
@@ -163,72 +135,56 @@ class SlurmScheduler(Scheduler):
         self.resources = resources
 
     def submit(self, job_name: str, script: str, workdir: Path) -> str:
-        """Submit a SLURM job."""
         workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
 
         script_file = workdir / "job_script.slurm"
-        slurm_header = f"""#!/bin/bash
-#SBATCH --job-name={job_name}
-#SBATCH --time={self.walltime}
-#SBATCH --partition={self.partition}
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --output={workdir}/slurm.out
-#SBATCH --error={workdir}/slurm.err
-
-set -e
-cd {workdir}
-{script}
-"""
-        script_file.write_text(slurm_header)
+        script_file.write_text(
+            f"#!/bin/bash\n"
+            f"#SBATCH --job-name={job_name}\n"
+            f"#SBATCH --time={self.walltime}\n"
+            f"#SBATCH --partition={self.partition}\n"
+            f"#SBATCH --ntasks=1\n"
+            f"#SBATCH --cpus-per-task=4\n"
+            f"#SBATCH --output={workdir}/slurm.out\n"
+            f"#SBATCH --error={workdir}/slurm.err\n\n"
+            f"set -e\ncd {workdir}\n{script}\n"
+        )
         script_file.chmod(0o755)
 
-        try:
-            result = subprocess.run(
-                ["sbatch", str(script_file)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            job_id = result.stdout.strip().split()[-1]
-            log.info(f"  Submitted SLURM job {job_id}")
-            return job_id
-        except Exception as e:
-            log.error(f"  Failed to submit SLURM job: {e}")
-            raise
+        result = subprocess.run(
+            ["sbatch", str(script_file)],
+            capture_output=True, text=True, check=True,
+        )
+        job_id = result.stdout.strip().split()[-1]
+        log.info("Submitted SLURM job %s", job_id)
+        return job_id
 
     def status(self, job_ids: list[str]) -> dict[str, JobStatus]:
-        """Poll SLURM job statuses via sacct."""
-        result = {}
-        for job_id in job_ids:
+        result: dict[str, JobStatus] = {}
+        for jid in job_ids:
             try:
-                output = subprocess.run(
-                    ["sacct", "-j", job_id, "-n", "-o", "State"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
+                out = subprocess.run(
+                    ["sacct", "-j", jid, "-n", "-o", "State"],
+                    capture_output=True, text=True, timeout=5,
                 ).stdout.strip()
-
-                state = output.split()[0].upper() if output else "UNKNOWN"
-
-                if state in ("RUNNING",):
-                    result[job_id] = JobStatus.RUNNING
-                elif state in ("COMPLETED", "COMPLETING"):
-                    result[job_id] = JobStatus.DONE
-                elif state in ("FAILED", "TIMEOUT", "CANCELLED"):
-                    result[job_id] = JobStatus.FAILED
-                elif state in ("PENDING", "CONFIGURING"):
-                    result[job_id] = JobStatus.PENDING
-                else:
-                    result[job_id] = JobStatus.UNKNOWN
+                state = out.split()[0].upper() if out else "UNKNOWN"
+                mapping = {
+                    "RUNNING": JobStatus.RUNNING,
+                    "COMPLETED": JobStatus.DONE,
+                    "COMPLETING": JobStatus.DONE,
+                    "FAILED": JobStatus.FAILED,
+                    "TIMEOUT": JobStatus.FAILED,
+                    "CANCELLED": JobStatus.FAILED,
+                    "PENDING": JobStatus.PENDING,
+                    "CONFIGURING": JobStatus.PENDING,
+                }
+                result[jid] = mapping.get(state, JobStatus.UNKNOWN)
             except Exception:
-                result[job_id] = JobStatus.UNKNOWN
-
+                result[jid] = JobStatus.UNKNOWN
         return result
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a SLURM job."""
         try:
             subprocess.run(["scancel", job_id], check=True, timeout=5)
             return True
@@ -236,8 +192,11 @@ cd {workdir}
             return False
 
 
+# ---------------------------------------------------------------------------
+# PBS / Torque
+# ---------------------------------------------------------------------------
+
 class PbsScheduler(Scheduler):
-    """PBS/Torque job scheduler."""
 
     def __init__(
         self,
@@ -252,66 +211,50 @@ class PbsScheduler(Scheduler):
         self.resources = resources
 
     def submit(self, job_name: str, script: str, workdir: Path) -> str:
-        """Submit a PBS job."""
         workdir = Path(workdir)
         workdir.mkdir(parents=True, exist_ok=True)
 
         script_file = workdir / "job_script.pbs"
-        pbs_header = f"""#!/bin/bash
-#PBS -N {job_name}
-#PBS -l walltime={self.walltime}
-#PBS -q {self.queue}
-#PBS -o {workdir}/pbs.out
-#PBS -e {workdir}/pbs.err
-
-set -e
-cd {workdir}
-{script}
-"""
-        script_file.write_text(pbs_header)
+        script_file.write_text(
+            f"#!/bin/bash\n"
+            f"#PBS -N {job_name}\n"
+            f"#PBS -l walltime={self.walltime}\n"
+            f"#PBS -q {self.queue}\n"
+            f"#PBS -o {workdir}/pbs.out\n"
+            f"#PBS -e {workdir}/pbs.err\n\n"
+            f"set -e\ncd {workdir}\n{script}\n"
+        )
         script_file.chmod(0o755)
 
-        try:
-            result = subprocess.run(
-                ["qsub", str(script_file)],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            job_id = result.stdout.strip()
-            log.info(f"  Submitted PBS job {job_id}")
-            return job_id
-        except Exception as e:
-            log.error(f"  Failed to submit PBS job: {e}")
-            raise
+        result = subprocess.run(
+            ["qsub", str(script_file)],
+            capture_output=True, text=True, check=True,
+        )
+        job_id = result.stdout.strip()
+        log.info("Submitted PBS job %s", job_id)
+        return job_id
 
     def status(self, job_ids: list[str]) -> dict[str, JobStatus]:
-        """Poll PBS job statuses via qstat."""
-        result = {}
-        for job_id in job_ids:
+        result: dict[str, JobStatus] = {}
+        for jid in job_ids:
             try:
-                output = subprocess.run(
-                    ["qstat", job_id],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
+                out = subprocess.run(
+                    ["qstat", jid],
+                    capture_output=True, text=True, timeout=5,
                 ).stdout
-
-                if "unknown Job" in output or not output:
-                    result[job_id] = JobStatus.DONE
-                elif "R" in output:
-                    result[job_id] = JobStatus.RUNNING
-                elif "Q" in output:
-                    result[job_id] = JobStatus.PENDING
+                if "unknown Job" in out or not out:
+                    result[jid] = JobStatus.DONE
+                elif " R " in out:
+                    result[jid] = JobStatus.RUNNING
+                elif " Q " in out:
+                    result[jid] = JobStatus.PENDING
                 else:
-                    result[job_id] = JobStatus.UNKNOWN
+                    result[jid] = JobStatus.UNKNOWN
             except Exception:
-                result[job_id] = JobStatus.UNKNOWN
-
+                result[jid] = JobStatus.UNKNOWN
         return result
 
     def cancel(self, job_id: str) -> bool:
-        """Cancel a PBS job."""
         try:
             subprocess.run(["qdel", job_id], check=True, timeout=5)
             return True
@@ -319,28 +262,29 @@ cd {workdir}
             return False
 
 
+# ---------------------------------------------------------------------------
+# Builder — extracts only what each scheduler needs
+# ---------------------------------------------------------------------------
+
 def build_scheduler(config) -> Scheduler:
     """
-    Build a scheduler from config.
-
-    Parameters
-    ----------
-    config : SchedulerConfig with keys:
-        - type: "local", "slurm", or "pbs"
-        - nworkers: int
-        - walltime: str (HH:MM:SS)
-        - resources: dict (extra params)
-
-    Returns
-    -------
-    Scheduler subclass
+    Build a scheduler from a :class:`SchedulerConfig` (or plain dict).
     """
-    cfg_dict = dict(config) if hasattr(config, "items") else config.model_dump()
-    sched_type = cfg_dict.pop("type", "local").lower()
+    if hasattr(config, "model_dump"):
+        cfg = config.model_dump()
+    elif hasattr(config, "items"):
+        cfg = dict(config)
+    else:
+        cfg = dict(config)
+
+    sched_type = cfg.get("type", "local").lower()
+    nworkers = cfg.get("nworkers", 4)
+    walltime = cfg.get("walltime", "01:00:00")
+    resources = cfg.get("resources", {})
 
     if sched_type == "slurm":
-        return SlurmScheduler(**cfg_dict)
+        return SlurmScheduler(nworkers=nworkers, walltime=walltime, **resources)
     elif sched_type == "pbs":
-        return PbsScheduler(**cfg_dict)
-    else:  # local
-        return LocalScheduler(**cfg_dict)
+        return PbsScheduler(nworkers=nworkers, walltime=walltime, **resources)
+    else:
+        return LocalScheduler(nworkers=nworkers)
