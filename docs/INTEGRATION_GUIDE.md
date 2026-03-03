@@ -1,6 +1,6 @@
-# Integration Guide: Lean GOCIA with Existing Modules
+# Integration Guide: Lean galoop with Existing Modules
 
-This guide explains how to integrate the new lean GOCIA core with the existing (proven) modules from the original codebase.
+This guide explains how to integrate the new lean galoop core with the existing (proven) modules from the original codebase.
 
 ---
 
@@ -149,9 +149,9 @@ from gocia.science.reproduce import splice, merge, mutate_add, mutate_remove, mu
 
 # New (from this codebase)
 from gocia.individual import Individual, STATUS, OPERATOR
-from gocia.database import GociaDB
+from gocia.database import GaloopDB
 from gocia.fingerprint import classify_postrelax, compute_soap
-from gocia.config import GociaConfig
+from gocia.config import GaloopConfig
 ```
 
 ### 3. **Fix Circular Import**
@@ -174,7 +174,7 @@ The new `database.py` uses the same schema as the original, minus:
 If migrating from an existing run, you may need to:
 ```sql
 -- Backup old DB
-cp gocia.db gocia.db.bak
+cp galoop.db galoop.db.bak
 
 -- Drop old columns if they exist
 ALTER TABLE structures DROP COLUMN fingerprint;
@@ -188,7 +188,7 @@ UPDATE structures SET status = 'desorbed' WHERE status = 'desorbed';
 ```
 
 **Config Schema:**
-Old `gocia.yaml` files need minimal updates:
+Old `galoop.yaml` files need minimal updates:
 - **Remove:** `fingerprint.soap_gate`, `weight_soap`, `weight_hist`, `energy_skip_tol`
 - **Keep:** `r_cut`, `n_max`, `l_max`, `duplicate_threshold`
 - All other sections (slab, adsorbates, calculator_stages, ga, conditions) are identical
@@ -202,17 +202,17 @@ Old code using `ind.fingerprint`, `ind.is_isomer`, `ind.isomer_of` will break. G
 # test_integration.py
 from pathlib import Path
 from gocia.config import load_config
-from gocia.database import GociaDB
+from gocia.database import GaloopDB
 from gocia.individual import Individual, STATUS
 from gocia.science.surface import load_slab
 from gocia.engine.calculator import build_pipeline
 from gocia.engine.scheduler import build_scheduler
 
 # 1. Load config
-cfg = load_config("gocia.yaml")
+cfg = load_config("galoop.yaml")
 
 # 2. Create DB
-with GociaDB("gocia.db") as db:
+with GaloopDB("galoop.db") as db:
     db.setup()
     
     # 3. Insert a test structure
@@ -262,23 +262,23 @@ mkdir gocia
 # 2. Copy files from this implementation
 cp individual.py config.py database.py fingerprint.py galoop.py cli.py gocia/
 
-# 3. Copy (don't modify) from original GOCIA
+# 3. Copy (don't modify) from original galoop
 cp -r /path/to/original/gocia/engine gocia/
 cp -r /path/to/original/gocia/science gocia/
 rm gocia/science/fingerprint.py  # Use our new one instead
 
 # 4. Copy example config and README
-cp example_gocia.yaml ./gocia.yaml
+cp example_galoop.yaml ./galoop.yaml
 cp README.md ./
 
-# 5. Edit gocia.yaml to match your system
-vim gocia.yaml
+# 5. Edit galoop.yaml to match your system
+vim galoop.yaml
 
 # 6. Run
-python cli.py run --config gocia.yaml --run-dir . --seed 42
+python cli.py run --config galoop.yaml --run-dir . --seed 42
 ```
 
-### For an Existing GOCIA Run
+### For an Existing galoop Run
 
 ```bash
 cd /path/to/existing/run
@@ -294,10 +294,10 @@ cp /path/to/new/config.py gocia/
 cp /path/to/new/galoop.py gocia/
 cp /path/to/new/cli.py gocia/
 
-# 3. If you have an old gocia.db, migrate it (see above)
-# 4. Update gocia.yaml (remove old fingerprint params)
+# 3. If you have an old galoop.db, migrate it (see above)
+# 4. Update galoop.yaml (remove old fingerprint params)
 # 5. Resume
-python -m gocia.cli run --config gocia.yaml --run-dir .
+python -m gocia.cli run --config galoop.yaml --run-dir .
 ```
 
 ---
@@ -317,8 +317,8 @@ If you see `sqlite3.OperationalError: no such table`:
 
 ### Config Errors
 If you see `ValidationError: fingerprint` or similar:
-- Update gocia.yaml to remove old fingerprint parameters
-- Use example_gocia.yaml as a template
+- Update galoop.yaml to remove old fingerprint parameters
+- Use example_galoop.yaml as a template
 
 ### Missing Modules
 If you see `ModuleNotFoundError: No module named 'dscribe'`:
@@ -348,7 +348,7 @@ With 4 workers, expect:
 Refer back to:
 - **Code organization**: IMPLEMENTATION_SUMMARY.md
 - **Design philosophy**: README.md
-- **Usage**: example_gocia.yaml + README.md
+- **Usage**: example_galoop.yaml + README.md
 - **Data model**: individual.py (well-commented)
 
 Good luck!

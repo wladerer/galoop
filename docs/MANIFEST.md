@@ -1,4 +1,4 @@
-# LEAN GOCIA — FINAL DELIVERY MANIFEST
+# LEAN galoop — FINAL DELIVERY MANIFEST
 
 **Date:** March 3, 2026  
 **Total Files:** 18  
@@ -37,7 +37,7 @@
 ### Configuration & Examples (1 file)
 | File | Purpose |
 |------|---------|
-| `example_gocia.yaml` | Template configuration (MACE + VASP) |
+| `example_galoop.yaml` | Template configuration (MACE + VASP) |
 
 ### Documentation (6 files, ~2000 lines)
 | File | Purpose |
@@ -60,23 +60,23 @@ cp individual.py database.py fingerprint.py config.py galoop.py cli.py gocia/
 cp calculator.py gocia/engine/
 cp scheduler.py gocia/engine/
 cp surface.py energy.py reproduce.py gocia/science/
-cp example_gocia.yaml gocia.yaml
+cp example_galoop.yaml galoop.yaml
 touch gocia/__init__.py gocia/engine/__init__.py gocia/science/__init__.py
 ```
 
-### 2. Edit gocia.yaml
+### 2. Edit galoop.yaml
 ```bash
 # Update for your system:
 # - slab.geometry (POSCAR path)
 # - adsorbates (your species)
 # - calculator_stages (MACE/VASP)
-vim gocia.yaml
+vim galoop.yaml
 ```
 
 ### 3. Install & Run
 ```bash
 pip install numpy pandas ase pydantic pyyaml click dscribe
-python -m gocia.cli run --config gocia.yaml --run-dir . --seed 42
+python -m gocia.cli run --config galoop.yaml --run-dir . --seed 42
 ```
 
 ---
@@ -125,7 +125,7 @@ python -m gocia.cli run --config gocia.yaml --run-dir . --seed 42
 
 **Start here:**
 1. `README.md` — Understand the architecture
-2. `example_gocia.yaml` — See configuration structure
+2. `example_galoop.yaml` — See configuration structure
 3. `QUICK_REFERENCE.md` — Setup checklist & commands
 
 **Deep dive:**
@@ -223,7 +223,7 @@ mace-torch >= 0.3 (for MACE)
 ## 🛠️ Architecture Highlights
 
 ### Single Source of Truth
-Database (`gocia.db`) is authoritative. Sentinels are verification only.
+Database (`galoop.db`) is authoritative. Sentinels are verification only.
 
 ### Async + Multi-Stage
 One job finishes → spawn one replacement. No blocking. Workers stay busy.
@@ -262,7 +262,7 @@ YAML-based. Add adsorbates, stages, or tune parameters without code changes.
 ## 🔄 Restart & Recovery
 
 **Complete data loss protection:**
-- All state stored in `gocia.db`
+- All state stored in `galoop.db`
 - Sentinels are metadata only
 - Kill the script at any time
 - Restart with same command
@@ -283,12 +283,12 @@ YAML-based. Add adsorbates, stages, or tune parameters without code changes.
 
 ### Enable verbose logging
 ```bash
-python -m gocia.cli run --config gocia.yaml --run-dir . --seed 42 -v
+python -m gocia.cli run --config galoop.yaml --run-dir . --seed 42 -v
 ```
 
 ### Check database directly
 ```bash
-sqlite3 my_run/gocia.db ".mode column" "SELECT id, status, generation, grand_canonical_energy FROM structures LIMIT 10;"
+sqlite3 my_run/galoop.db ".mode column" "SELECT id, status, generation, grand_canonical_energy FROM structures LIMIT 10;"
 ```
 
 ### Read calculation logs
@@ -310,7 +310,7 @@ If you use this code in research, please cite:
 
 ```bibtex
 @software{gocia_lean_2026,
-  title = {Lean GOCIA: Simplified Genetic Algorithm for Electrochemical Surface Exploration},
+  title = {Lean galoop: Simplified Genetic Algorithm for Electrochemical Surface Exploration},
   author = {[Your Name]},
   year = {2026},
   url = {https://github.com/...},
@@ -356,18 +356,18 @@ Licensed under [LICENSE TYPE] — see LICENSE file for details
 
 ## 🎓 Learning Path
 
-**If you're new to GOCIA:**
+**If you're new to galoop:**
 1. Read `README.md` (20 min)
-2. Review `example_gocia.yaml` (5 min)
+2. Review `example_galoop.yaml` (5 min)
 3. Run on MACE-only config (1-2 hours)
 4. Study `galoop.py` main loop (30 min)
-5. Customize `gocia.yaml` for your system
+5. Customize `galoop.yaml` for your system
 6. Scale to VASP if needed
 
 **If you're experienced:**
 1. Skim `IMPLEMENTATION_SUMMARY.md` (15 min)
 2. Copy files into project structure
-3. Edit `gocia.yaml` for your system
+3. Edit `galoop.yaml` for your system
 4. Run production workflow
 5. Post-process results
 
@@ -383,7 +383,7 @@ This is a **complete, production-ready implementation**. Every module is:
 
 **No additional code needed to run.** Just:
 1. Copy files
-2. Edit `gocia.yaml`
+2. Edit `galoop.yaml`
 3. Run
 
 ---
@@ -402,7 +402,7 @@ Before running, verify you have:
 - [ ] `surface.py`
 - [ ] `energy.py`
 - [ ] `reproduce.py`
-- [ ] `example_gocia.yaml`
+- [ ] `example_galoop.yaml`
 - [ ] `gocia/__init__.py` (empty)
 - [ ] `gocia/engine/__init__.py` (empty)
 - [ ] `gocia/science/__init__.py` (empty)
@@ -416,7 +416,7 @@ All 18 files are in `/mnt/user-data/outputs/`
 **Next step:**
 ```bash
 cd my_gocia_project
-python -m gocia.cli run --config gocia.yaml --run-dir . --seed 42
+python -m gocia.cli run --config galoop.yaml --run-dir . --seed 42
 ```
 
 **Good luck!** 🧬

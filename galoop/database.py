@@ -14,7 +14,7 @@ from typing import Iterator
 
 import pandas as pd
 
-from individual import Individual, STATUS
+from galoop.individual import Individual, STATUS
 
 
 def _enc(value) -> str | None:
@@ -76,7 +76,7 @@ END;
 """
 
 
-class GociaDB:
+class GaloopDB:
     """SQLite database interface."""
 
     def __init__(self, path: str | Path) -> None:
@@ -95,7 +95,7 @@ class GociaDB:
             self._conn.close()
             self._conn = None
 
-    def __enter__(self) -> GociaDB:
+    def __enter__(self) -> GaloopDB:
         self.connect()
         return self
 

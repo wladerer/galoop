@@ -1,4 +1,4 @@
-# Lean GOCIA — Quick Reference Card
+# Lean galoop — Quick Reference Card
 
 ## Files You Have
 
@@ -19,7 +19,7 @@ reproduce.py       (300 lines)  ← GA operators
 
 ### Configuration & Docs (5 files)
 ```
-example_gocia.yaml              ← Template config
+example_galoop.yaml              ← Template config
 README.md                       ← User guide
 IMPLEMENTATION_SUMMARY.md       ← Architecture details
 INTEGRATION_GUIDE.md            ← Integration instructions
@@ -47,12 +47,12 @@ touch gocia/__init__.py gocia/engine/__init__.py gocia/science/__init__.py
 
 ### 3. Copy config template
 ```bash
-cp example_gocia.yaml gocia.yaml
+cp example_galoop.yaml galoop.yaml
 ```
 
-### 4. Edit gocia.yaml
+### 4. Edit galoop.yaml
 ```bash
-vim gocia.yaml
+vim galoop.yaml
 # Update at minimum:
 # - slab.geometry (path to POSCAR)
 # - adsorbates (your species)
@@ -73,10 +73,10 @@ python -c "from gocia.individual import Individual; print('✓ OK')"
 ### 7. Initialize database
 ```python
 python -c "
-from gocia.database import GociaDB
+from gocia.database import GaloopDB
 from pathlib import Path
 Path('runs').mkdir(exist_ok=True)
-with GociaDB('runs/test.db') as db:
+with GaloopDB('runs/test.db') as db:
     db.setup()
     print('✓ DB created')
 "
@@ -86,7 +86,7 @@ with GociaDB('runs/test.db') as db:
 ```python
 python -c "
 from gocia.config import load_config
-cfg = load_config('gocia.yaml')
+cfg = load_config('galoop.yaml')
 print(f'✓ Config loaded: {len(cfg.adsorbates)} adsorbates, {len(cfg.calculator_stages)} stages')
 "
 ```
@@ -104,7 +104,7 @@ chmod +x run_ga.py
 
 ### 10. Launch!
 ```bash
-python run_ga.py run --config gocia.yaml --run-dir ./my_run --seed 42
+python run_ga.py run --config galoop.yaml --run-dir ./my_run --seed 42
 ```
 
 ---
@@ -127,7 +127,7 @@ python -c "
 import pandas as pd
 df = pd.read_sql(
     'SELECT id, generation, grand_canonical_energy, extra_data FROM structures WHERE status=\"converged\" ORDER BY grand_canonical_energy LIMIT 20',
-    'sqlite:///my_run/gocia.db'
+    'sqlite:///my_run/galoop.db'
 )
 df.to_csv('best_structures.csv', index=False)
 print(f'Exported {len(df)} structures')
@@ -234,7 +234,7 @@ ORDER BY generation;
 ### Export as CSV (pandas)
 ```python
 import pandas as pd
-df = pd.read_sql("SELECT * FROM structures", "sqlite:///gocia.db")
+df = pd.read_sql("SELECT * FROM structures", "sqlite:///galoop.db")
 df.to_csv("export.csv", index=False)
 ```
 
@@ -304,8 +304,8 @@ fingerprint:
 
 If the job is killed/crashes:
 ```bash
-# All state is in gocia.db, no data loss
-python run_ga.py run --config gocia.yaml --run-dir ./my_run --seed 42
+# All state is in galoop.db, no data loss
+python run_ga.py run --config galoop.yaml --run-dir ./my_run --seed 42
 # Loop resumes from where it left off
 ```
 
@@ -318,7 +318,7 @@ python run_ga.py run --config gocia.yaml --run-dir ./my_run --seed 42
 import pandas as pd
 from pathlib import Path
 df = pd.read_sql("SELECT * FROM structures WHERE status='converged'", 
-                 "sqlite:///my_run/gocia.db")
+                 "sqlite:///my_run/galoop.db")
 best = df.loc[df['grand_canonical_energy'].idxmin()]
 struct_path = Path(best['geometry_path']).parent / 'CONTCAR'
 print(f"Best: {struct_path}")
@@ -333,7 +333,7 @@ import shutil
 
 df = pd.read_sql(
     'SELECT geometry_path FROM structures WHERE status=\"converged\" ORDER BY grand_canonical_energy LIMIT 5',
-    'sqlite:///my_run/gocia.db'
+    'sqlite:///my_run/galoop.db'
 )
 
 for i, path in enumerate(df['geometry_path']):
@@ -348,7 +348,7 @@ for i, path in enumerate(df['geometry_path']):
 ## Files to Read (in order)
 
 1. **This file** — Quick reference
-2. **example_gocia.yaml** — Understand config structure
+2. **example_galoop.yaml** — Understand config structure
 3. **README.md** — Architecture overview
 4. **galoop.py** (read `run()` function) — Main loop flow
 5. **individual.py** — Data model
@@ -388,7 +388,7 @@ for i, path in enumerate(df['geometry_path']):
 
 ✅ **Run is working:**
 - `gen_000/` created with random structures
-- `gocia.db` exists and grows
+- `galoop.db` exists and grows
 - MACE/VASP calculations run without error
 - New generations appear (`gen_001/`, `gen_002/`, etc.)
 - Best energy improves over generations
@@ -414,7 +414,7 @@ If you find bugs or have ideas:
 
 **Ready to run! Type:**
 ```bash
-python run_ga.py run --config gocia.yaml --run-dir ./my_run --seed 42
+python run_ga.py run --config galoop.yaml --run-dir ./my_run --seed 42
 ```
 
 **Happy searching!** 🧬

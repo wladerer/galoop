@@ -124,7 +124,7 @@ class ConditionsConfig(BaseModel):
     pH: float = Field(default=0.0, ge=0.0, le=14.0)
 
 
-class GociaConfig(BaseModel):
+class GaloopConfig(BaseModel):
     """Root configuration."""
 
     slab: SlabConfig
@@ -145,15 +145,15 @@ class GociaConfig(BaseModel):
         return v.lower()
 
     @model_validator(mode="after")
-    def _unique_stage_names(self) -> GociaConfig:
+    def _unique_stage_names(self) -> GaloopConfig:
         names = [s.name for s in self.calculator_stages]
         if len(names) != len(set(names)):
             raise ValueError("Duplicate calculator stage names")
         return self
 
 
-def load_config(path: str | Path) -> GociaConfig:
-    """Load and validate gocia.yaml."""
+def load_config(path: str | Path) -> GaloopConfig:
+    """Load and validate galoop.yaml."""
     try:
         import yaml
     except ImportError as exc:
@@ -169,4 +169,4 @@ def load_config(path: str | Path) -> GociaConfig:
     if raw is None:
         raise ValueError("Config file is empty")
 
-    return GociaConfig.model_validate(raw)
+    return GaloopConfig.model_validate(raw)

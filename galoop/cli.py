@@ -11,20 +11,20 @@ from pathlib import Path
 import click
 import numpy as np
 
-from config import load_config
-from database import GociaDB
-from galoop import run as run_ga
+from galoop.config import load_config
+from galoop.database import GaloopDB
+from galoop.galoop import run as run_ga
 
 
 @click.group()
 @click.version_option()
 def cli():
-    """GOCIA — lean genetic algorithm for adsorbate structure search."""
+    """galoop — lean genetic algorithm for adsorbate structure search."""
     pass
 
 
 @cli.command()
-@click.option("--config", "-c", default="gocia.yaml", type=click.Path(exists=True))
+@click.option("--config", "-c", default="galoop.yaml", type=click.Path(exists=True))
 @click.option("--run-dir", "-d", default=".", type=click.Path())
 @click.option("--seed", type=int, default=None)
 @click.option("--verbose", "-v", is_flag=True)
@@ -61,7 +61,7 @@ def run(config: str, run_dir: str, seed: int, verbose: bool):
         stages = build_pipeline(cfg.calculator_stages)
         scheduler = build_scheduler(cfg.scheduler)
 
-        with GociaDB(run_dir_path / "gocia.db") as db:
+        with GaloopDB(run_dir_path / "galoop.db") as db:
             db.setup()
 
         rng = np.random.default_rng(seed)
@@ -77,13 +77,13 @@ def run(config: str, run_dir: str, seed: int, verbose: bool):
 def status(run_dir: str):
     """Print run status."""
     run_dir_path = Path(run_dir)
-    db_path = run_dir_path / "gocia.db"
+    db_path = run_dir_path / "galoop.db"
 
     if not db_path.exists():
         click.echo(f"No database at {db_path}", err=True)
         sys.exit(1)
 
-    with GociaDB(db_path) as db:
+    with GaloopDB(db_path) as db:
         counts = db.count_by_status()
         click.echo("\nStructure counts by status:")
         for status, n in sorted(counts.items()):

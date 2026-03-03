@@ -3,8 +3,8 @@ from setuptools import setup, find_packages
 setup(
     name="galoop",
     version="0.1.0",
-    description="Lean genetic algorithm for electrochemical surface adsorbate structure search",
-    author="Your Name",
+    description="Genetic algorithm for electrochemical surface adsorbate structure search",
+    author="Will Laderer",
     author_email="your.email@example.com",
     url="https://github.com/wladerer/galoop",
     packages=find_packages(),
@@ -17,9 +17,11 @@ setup(
         "pyyaml>=6.0",
         "click>=8.0",
         "dscribe>=1.2",
+        "torch>=2.0",
+        "mace-torch>=0.3",
+        "pytest"
     ],
     extras_require={
-        "mace": ["mace-torch>=0.3"],
         "dev": ["pytest", "black", "flake8"],
     },
     entry_points={

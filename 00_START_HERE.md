@@ -1,4 +1,4 @@
-# 🎯 LEAN GOCIA — COMPLETE IMPLEMENTATION
+# 🎯 LEAN galoop — COMPLETE IMPLEMENTATION
 
 ## ✅ Delivery Complete
 
@@ -22,7 +22,7 @@ You now have a **complete, production-ready genetic algorithm** for exploring el
 |-------|---------|---------|
 | **Core GA** | individual.py<br>database.py<br>galoop.py<br>cli.py | Data model, DB, main loop, CLI |
 | **Fingerprinting** | fingerprint.py | SOAP-only duplicate detection |
-| **Configuration** | config.py<br>example_gocia.yaml | Pydantic validation + example config |
+| **Configuration** | config.py<br>example_galoop.yaml | Pydantic validation + example config |
 | **Calculation** | calculator.py | Multi-stage MACE/VASP pipeline |
 | **Scheduling** | scheduler.py | Local/SLURM/PBS job submission |
 | **Science** | surface.py<br>energy.py<br>reproduce.py | Slab placement, CHE energy, GA operators |
@@ -59,13 +59,13 @@ cp ../surface.py ../energy.py ../reproduce.py gocia/science/
 touch gocia/__init__.py gocia/engine/__init__.py gocia/science/__init__.py
 
 # Copy config template
-cp ../example_gocia.yaml gocia.yaml
+cp ../example_galoop.yaml galoop.yaml
 ```
 
 ### 2️⃣ Configure (5 minutes)
 ```bash
-# Edit gocia.yaml
-vim gocia.yaml
+# Edit galoop.yaml
+vim galoop.yaml
 
 # At minimum, update:
 # - slab.geometry: path to POSCAR
@@ -77,12 +77,12 @@ vim gocia.yaml
 ```bash
 pip install numpy pandas ase pydantic pyyaml click dscribe
 
-python -m gocia.cli run --config gocia.yaml --run-dir . --seed 42
+python -m galoop.cli run --config galoop.yaml --run-dir . --seed 42
 ```
 
 **That's it!** The GA runs asynchronously. Monitor with:
 ```bash
-watch -n 5 "python -m gocia.cli status --run-dir ."
+watch -n 5 "python -m galoop.cli status --run-dir ."
 ```
 
 ---
@@ -92,7 +92,7 @@ watch -n 5 "python -m gocia.cli status --run-dir ."
 ### Design Philosophy: **Less is More**
 
 ```
-Original GOCIA:         Lean GOCIA:
+Original galoop:         Lean galoop:
 ├─ 15,000 lines        ├─ 3,500 lines
 ├─ Complex fingerprint ├─ Simple SOAP post-relax
 ├─ Multi-tier DB       ├─ Single source of truth
@@ -233,7 +233,7 @@ ops = [..., MY_OPERATOR]
 |----------|-----------|--------|
 | **README.md** | 20 min | Architecture + quickstart |
 | **QUICK_REFERENCE.md** | 10 min | Setup checklist, commands |
-| **example_gocia.yaml** | 5 min | All config options |
+| **example_galoop.yaml** | 5 min | All config options |
 | **galoop.py** | 30 min | Main loop flow |
 | **IMPLEMENTATION_SUMMARY.md** | 20 min | Design rationale |
 | **INTEGRATION_GUIDE.md** | 15 min | How to extend |
@@ -304,8 +304,8 @@ ops = [..., MY_OPERATOR]
 ### 🔍 Debugging Tips
 - **Enable verbose logging**: `... run ... -v`
 - **Check logs**: `tail my_run/gen_001/struct_0000/stage_vasp_fine/slurm.out`
-- **Inspect database**: `sqlite3 gocia.db "SELECT * FROM structures LIMIT 5;"`
-- **Test imports**: `python -c "from gocia.individual import Individual; print('OK')"`
+- **Inspect database**: `sqlite3 galoop.db "SELECT * FROM structures LIMIT 5;"`
+- **Test imports**: `python -c "from galoop.individual import Individual; print('OK')"`
 
 ---
 
@@ -313,15 +313,15 @@ ops = [..., MY_OPERATOR]
 
 ### Built-in Help
 ```bash
-python -m gocia.cli --help
-python -m gocia.cli run --help
+python -m galoop.cli --help
+python -m galoop.cli run --help
 ```
 
 ### Documentation Files
 - **Quick start:** `QUICK_REFERENCE.md`
 - **Full guide:** `README.md`
 - **Architecture:** `IMPLEMENTATION_SUMMARY.md`
-- **Config:** `example_gocia.yaml`
+- **Config:** `example_galoop.yaml`
 
 ### Code Comments
 - Every function has a docstring
@@ -334,7 +334,7 @@ python -m gocia.cli run --help
 
 ### Order to Read
 1. **README.md** (20 min) — Get the big picture
-2. **example_gocia.yaml** (5 min) — See config structure
+2. **example_galoop.yaml** (5 min) — See config structure
 3. **QUICK_REFERENCE.md** (10 min) — Setup & commands
 4. **galoop.py** (30 min) — Understand main loop
 5. **Other modules** (60 min) — Dive into implementation
@@ -354,14 +354,14 @@ python -m gocia.cli run --help
 
 ### Immediate (Today)
 1. ✅ Copy all 11 Python files to `gocia/` subdirectories
-2. ✅ Copy `example_gocia.yaml` → `gocia.yaml`
-3. ✅ Edit `gocia.yaml` for your slab + adsorbates
+2. ✅ Copy `example_galoop.yaml` → `galoop.yaml`
+3. ✅ Edit `galoop.yaml` for your slab + adsorbates
 4. ✅ Install dependencies: `pip install numpy pandas ase pydantic pyyaml click dscribe`
-5. ✅ Run first test: `python -m gocia.cli run --config gocia.yaml --run-dir test_run --seed 42 -v`
+5. ✅ Run first test: `python -m galoop.cli run --config galoop.yaml --run-dir test_run --seed 42 -v`
 
 ### This Week
 1. ✅ Let first run complete (1-2 hours for MACE-only)
-2. ✅ Check results: `python -m gocia.cli status --run-dir test_run`
+2. ✅ Check results: `python -m galoop.cli status --run-dir test_run`
 3. ✅ Analyze best structures
 4. ✅ Tune parameters if needed (fmax, population_size, etc.)
 
@@ -406,7 +406,7 @@ You have everything you need:
 → Read `QUICK_REFERENCE.md`
 
 ### For Configuration Questions
-→ Read `example_gocia.yaml` + `config.py`
+→ Read `example_galoop.yaml` + `config.py`
 
 ### For Code Questions
 → Read the Python files (all well-commented)
@@ -416,7 +416,7 @@ You have everything you need:
 ## 🙏 Final Notes
 
 This implementation represents:
-- ✅ **Months of design** (distilling GOCIA architecture to essentials)
+- ✅ **Months of design** (distilling galoop architecture to essentials)
 - ✅ **Clean coding practices** (minimal, focused, documented)
 - ✅ **Production readiness** (error handling, logging, restart safety)
 - ✅ **Flexibility** (supports MACE, VASP, custom calculators)
@@ -433,17 +433,17 @@ This implementation represents:
 cd my_gocia_project
 
 # Run the GA
-python -m gocia.cli run --config gocia.yaml --run-dir . --seed 42
+python -m galoop.cli run --config galoop.yaml --run-dir . --seed 42
 
 # Monitor progress
-watch -n 5 "python -m gocia.cli status --run-dir ."
+watch -n 5 "python -m galoop.cli status --run-dir ."
 
 # When done, analyze
 python -c "
 import pandas as pd
 df = pd.read_sql(
     'SELECT * FROM structures WHERE status=\"converged\" ORDER BY grand_canonical_energy',
-    'sqlite:///gocia.db'
+    'sqlite:///galoop.db'
 )
 print(df.head(10))
 "

@@ -1,4 +1,4 @@
-# Lean GOCIA
+# Lean galoop
 
 A simplified genetic algorithm for exploring surface adsorbate structures under electrochemical conditions.
 
@@ -16,7 +16,7 @@ A simplified genetic algorithm for exploring surface adsorbate structures under 
 - No blocking on generation boundaries
 
 ### 3. **Flexible Multi-Stage Calculator Pipeline**
-Configure in `gocia.yaml` to run:
+Configure in `galoop.yaml` to run:
 - **MACE only** (fast, low accuracy)
 - **MACE → VASP coarse → VASP fine** (hybrid, production)
 - **VASP only** (pure DFT)
@@ -53,19 +53,19 @@ pip install vasp  # (or get it from your HPC)
    # Create slab.vasp with selective dynamics (frozen bottom layers)
    ```
 
-2. **Create gocia.yaml:**
+2. **Create galoop.yaml:**
    ```bash
-   cp example_gocia.yaml gocia.yaml
+   cp example_galoop.yaml galoop.yaml
    # Edit to match your system
    ```
 
 3. **Initialize the run:**
    ```bash
-   python cli.py run --config gocia.yaml --run-dir ./my_run
+   python cli.py run --config galoop.yaml --run-dir ./my_run
    ```
    This:
    - Validates config
-   - Creates `my_run/gocia.db` with schema
+   - Creates `my_run/galoop.db` with schema
    - Generates `gen_000/` with random initial population
    - Starts the main GA loop
 
@@ -83,12 +83,12 @@ python cli.py stop --run-dir ./my_run
 
 After the run:
 - Best structures are in `gen_NNN/` directories
-- `gocia.db` has complete genealogy
+- `galoop.db` has complete genealogy
 - Analyze with pandas/SQLite:
   ```python
   import pandas as pd
   df = pd.read_sql("SELECT * FROM structures WHERE status='converged' ORDER BY grand_canonical_energy", 
-                   'sqlite:///my_run/gocia.db')
+                   'sqlite:///my_run/galoop.db')
   ```
 
 ---
@@ -221,7 +221,7 @@ def _sample_operator(config, rng):
 
 ### Change Duplicate Threshold
 
-Edit `gocia.yaml`:
+Edit `galoop.yaml`:
 ```yaml
 fingerprint:
   duplicate_threshold: 0.85  # Stricter (fewer duplicates flagged)
@@ -229,7 +229,7 @@ fingerprint:
 
 ### Add a New Adsorbate
 
-Just add to `adsorbates` in gocia.yaml:
+Just add to `adsorbates` in galoop.yaml:
 ```yaml
 adsorbates:
   - symbol: N

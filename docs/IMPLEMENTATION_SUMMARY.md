@@ -1,4 +1,4 @@
-# Lean GOCIA Implementation Summary
+# Lean galoop Implementation Summary
 
 ## What Was Built
 
@@ -43,7 +43,7 @@ Pydantic models for validation:
 - `SlabConfig`, `AdsorbateConfig`, `StageConfig`, `SchedulerConfig`
 - `FingerprintConfig` (SOAP params only)
 - `GAConfig`, `ConditionsConfig`
-- Root `GociaConfig` with cross-field validation
+- Root `GaloopConfig` with cross-field validation
 
 Load from YAML via `load_config(path)`.
 
@@ -153,10 +153,10 @@ gocia/
 ├── config.py          # Configuration + validation
 ├── galoop.py          # Main GA loop
 ├── cli.py             # CLI entry point
-├── example_gocia.yaml # Example config
+├── example_galoop.yaml # Example config
 └── README.md          # Usage guide
 
-(Assumed to be imported/reused from original GOCIA):
+(Assumed to be imported/reused from original galoop):
 ├── engine/
 │   ├── calculator.py  # build_pipeline(), run_pipeline()
 │   ├── scheduler.py   # build_scheduler(), submit_structure()
@@ -175,11 +175,11 @@ The new code **does not** reimplement surface placement, energy calculation, or 
 ```bash
 # 1. Setup
 mkdir my_run && cd my_run
-cp ../example_gocia.yaml gocia.yaml
-# Edit gocia.yaml to match your system
+cp ../example_galoop.yaml galoop.yaml
+# Edit galoop.yaml to match your system
 
 # 2. Run
-python ../cli.py run --config gocia.yaml --run-dir . --seed 42
+python ../cli.py run --config galoop.yaml --run-dir . --seed 42
 
 # 3. Monitor
 watch "python ../cli.py status --run-dir ."
@@ -191,7 +191,7 @@ python ../cli.py stop --run-dir .
 python -c "
 import pandas as pd
 df = pd.read_sql('SELECT * FROM structures WHERE status=\"converged\"', 
-                 'sqlite:///gocia.db')
+                 'sqlite:///galoop.db')
 df = df.sort_values('grand_canonical_energy')
 print(df[['id', 'generation', 'grand_canonical_energy', 'extra_data']].head(20))
 "
@@ -216,7 +216,7 @@ print(df[['id', 'generation', 'grand_canonical_energy', 'extra_data']].head(20))
 ## Next Steps
 
 1. **Test on a small system** (e.g., 20 structures, 5 generations, MACE only)
-2. **Add your calculator stages** to `gocia.yaml` (MACE, VASP, hybrid, etc.)
+2. **Add your calculator stages** to `galoop.yaml` (MACE, VASP, hybrid, etc.)
 3. **Tune GA parameters** (population_size, max_generations, max_stall_generations)
 4. **Adjust fingerprint threshold** if duplicates are being missed (lower threshold) or over-flagged (raise threshold)
 5. **Post-process results** with pandas/SQLite queries
@@ -249,9 +249,9 @@ print(df[['id', 'generation', 'grand_canonical_energy', 'extra_data']].head(20))
 2. **fingerprint.py** — See how SOAP comparison works
 3. **galoop.py** — Main loop; read `run()` and `_process_one()` flow
 4. **config.py** — Validation schema
-5. **example_gocia.yaml** — Configuration template
+5. **example_galoop.yaml** — Configuration template
 6. **README.md** — User-facing guide
 
 ---
 
-**Total effort**: ~2000 lines of focused, purposeful code. Ready to integrate with existing calculator + scheduler + surface science modules from the original GOCIA.
+**Total effort**: ~2000 lines of focused, purposeful code. Ready to integrate with existing calculator + scheduler + surface science modules from the original galoop.

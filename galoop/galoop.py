@@ -14,9 +14,9 @@ from pathlib import Path
 import numpy as np
 from ase.io import read, write
 
-from individual import Individual, STATUS, OPERATOR
-from database import GociaDB
-from fingerprint import classify_postrelax, compute_soap
+from galoop.individual import Individual, STATUS, OPERATOR
+from galoop.database import GaloopDB
+from galoop.fingerprint import classify_postrelax, compute_soap
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ def run(
 
     Parameters
     ----------
-    config : Validated GociaConfig
+    config : Validated GaloopConfig
     run_dir : Root run directory
     slab_info : SlabInfo from load_slab()
     stages : Calculator stages from build_pipeline()
@@ -54,7 +54,7 @@ def run(
         ads.symbol: ads.chemical_potential for ads in config.adsorbates
     }
 
-    with GociaDB(run_dir / "gocia.db") as db:
+    with GaloopDB(run_dir / "galoop.db") as db:
         db.setup()
 
         # Build or load initial population
@@ -493,7 +493,7 @@ def _submit_one(ind, run_dir, db, scheduler, active_jobs, config):
     if not ind.geometry_path:
         return
     struct_dir = Path(ind.geometry_path).parent
-    config_path = (run_dir / "gocia.yaml").resolve()
+    config_path = (run_dir / "galoop.yaml").resolve()
     body = f"cd {struct_dir.resolve()}\ngocia _run-pipeline {struct_dir.resolve()} --config {config_path}\n"
     job_name = f"gocia_{struct_dir.parent.name}_{struct_dir.name}"
 
@@ -590,6 +590,6 @@ def _read_sentinel(struct_dir):
 
 def _row_to_individual(row):
     """Convert DB row to Individual."""
-    from database import _row_to_individual as convert
+    from galoop.database import _row_to_individual as convert
 
     return convert(row)
