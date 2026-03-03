@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+*.egg
+.DS_Store
+*.swp
+*.swo
+*~
+.venv/
+venv/
+env/
+.idea/
+.vscode/
+
+# Project-specific
+gocia.db
+*.db
+runs/
+gen_*/
+test_run/
+*.log
+slurm-*.out
