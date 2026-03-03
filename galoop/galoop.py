@@ -15,8 +15,9 @@ import numpy as np
 from ase.io import read, write
 
 from galoop.individual import Individual, STATUS, OPERATOR
-from galoop.database import GaloopDB, row_to_individual
+from galoop.database import GaloopDB
 from galoop.fingerprint import classify_postrelax, compute_soap
+from galoop.science.reproduce import splice, merge, mutate_add, mutate_remove
 
 log = logging.getLogger(__name__)
 
@@ -112,13 +113,8 @@ def run(
 
                     del active_jobs[struct_key]
 
-                    # Spawn a replacement
-                    new_ind = _spawn_one(run_dir, db, config, slab_info, rng, total_evals)
-                    if new_ind:
-                        _submit_one(new_ind, run_dir, db, scheduler, active_jobs, config)
-
-            # Top up worker pool
-            _fill_workers(run_dir, db, scheduler, active_jobs, config)
+            # Top up worker pool: submit PENDING first, spawn only when pool is empty
+            _fill_workers(run_dir, db, scheduler, active_jobs, config, slab_info, rng, total_evals)
 
             # Convergence check
             if not active_jobs and not db.get_by_status(STATUS.PENDING):
@@ -164,10 +160,14 @@ def _handle_converged(
         )
 
         if label == "duplicate":
-            log.info("  %s: duplicate of %s", ind.id, dup_id)
+            sim = _best_similarity(soap_vec, soap_cache)
+            log.info("  %s: duplicate of %s  (Tanimoto=%.3f)", ind.id, dup_id, sim)
             ind = ind.mark_duplicate()
+            ind.extra_data = {**ind.extra_data, "dup_of": dup_id, "tanimoto": float(sim)}
             db.update(ind)
         else:
+            sim = _best_similarity(soap_vec, soap_cache) if soap_cache else 0.0
+            log.debug("  %s: unique  (best Tanimoto=%.3f)", ind.id, sim)
             raw_e = _read_energy(struct_dir)
             gce = grand_canonical_energy(
                 raw_energy=raw_e,
@@ -235,6 +235,7 @@ def _build_initial_population(config, slab_info, db, run_dir, rng):
                         zmin=slab_info.zmin,
                         zmax=slab_info.zmax,
                         n_orientations=ads_cfg.n_orientations,
+                        binding_index=ads_cfg.binding_index,
                         rng=rng,
                     )
         except Exception as exc:
@@ -265,9 +266,6 @@ def _build_initial_population(config, slab_info, db, run_dir, rng):
 # ── offspring spawning ────────────────────────────────────────────────────
 
 def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
-    from galoop.science.reproduce import splice, merge
-    from galoop.science.surface import load_adsorbate, place_adsorbate
-
     selectable = db.selectable_pool()
 
     bucket_n = max(1, (total_evals + config.ga.population_size) // config.ga.population_size)
@@ -283,9 +281,10 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
         if len(selectable) < n_parents:
             return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
 
-        # Boltzmann-weighted selection
+        # Boltzmann-weighted selection (shift by min for numerical stability)
         energies = np.array([p.grand_canonical_energy or 0.0 for p in selectable])
-        weights = np.exp(-energies / 0.1)
+        shifted = energies - energies.min()
+        weights = np.exp(-shifted / 0.1)
         weights /= weights.sum()
         indices = rng.choice(len(selectable), size=n_parents, replace=False, p=weights)
         parents = [selectable[i] for i in indices]
@@ -303,6 +302,15 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
             child, _ = splice(parent_atoms[0], parent_atoms[1], slab_info.n_slab_atoms, rng=rng)
         elif op == OPERATOR.MERGE:
             child = merge(parent_atoms[0], parent_atoms[1], slab_info.n_slab_atoms, rng=rng)
+        elif op == OPERATOR.MUTATE_ADD:
+            # pick a random adsorbate symbol from config
+            sym = str(rng.choice([a.symbol for a in config.adsorbates]))
+            child = mutate_add(parent_atoms[0], slab_info.n_slab_atoms, sym, rng=rng)
+        elif op == OPERATOR.MUTATE_REMOVE:
+            result = mutate_remove(parent_atoms[0], slab_info.n_slab_atoms, rng=rng)
+            if result is None:
+                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+            child = result
         else:
             return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
 
@@ -359,7 +367,9 @@ def _place_random(run_dir, bucket_dir, db, config, slab_info, rng):
             current = place_adsorbate(
                 current, ads_atoms[sym],
                 slab_info.zmin, slab_info.zmax,
-                n_orientations=ads_cfg.n_orientations, rng=rng,
+                n_orientations=ads_cfg.n_orientations,
+                binding_index=ads_cfg.binding_index,
+                rng=rng,
             )
 
     poscar = struct_dir / "POSCAR"
@@ -378,19 +388,20 @@ def _place_random(run_dir, bucket_dir, db, config, slab_info, rng):
 
 # ── job submission ────────────────────────────────────────────────────────
 
-def _fill_workers(run_dir, db, scheduler, active_jobs, config):
+def _fill_workers(run_dir, db, scheduler, active_jobs, config, slab_info, rng, total_evals):
     n_active = len(active_jobs)
     limit = scheduler.nworkers
 
     if n_active >= limit:
         return
 
+    # Submit existing PENDING structures before spawning any offspring
     for ind in db.get_by_status(STATUS.PENDING):
         if n_active >= limit:
-            break
+            return
         if not ind.geometry_path:
             continue
-        struct_dir = Path(ind.geometry_path).parent
+        struct_dir = Path(ind.geometry_path).resolve().parent
         if not struct_dir.exists():
             ind = ind.with_status(STATUS.FAILED)
             db.update(ind)
@@ -399,6 +410,14 @@ def _fill_workers(run_dir, db, scheduler, active_jobs, config):
         if key in active_jobs:
             continue
         _submit_one(ind, run_dir, db, scheduler, active_jobs, config)
+        n_active += 1
+
+    # Only spawn new offspring once the PENDING pool is drained
+    while n_active < limit:
+        new_ind = _spawn_one(run_dir, db, config, slab_info, rng, total_evals)
+        if new_ind is None:
+            break
+        _submit_one(new_ind, run_dir, db, scheduler, active_jobs, config)
         n_active += 1
 
 
@@ -527,3 +546,11 @@ def _read_sentinel(struct_dir):
         if (struct_dir / name).exists():
             return name.lower()
     return None
+
+
+def _best_similarity(soap_vec: np.ndarray, soap_cache: dict) -> float:
+    """Return the highest Tanimoto similarity between soap_vec and anything in cache."""
+    from galoop.fingerprint import tanimoto_similarity
+    if not soap_cache:
+        return 0.0
+    return max(tanimoto_similarity(soap_vec, v) for v in soap_cache.values())
