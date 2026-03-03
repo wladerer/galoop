@@ -1,0 +1,79 @@
+
+# gocia.yaml — Example configuration for a lean GOCIA run
+# Hybrid MACE + VASP workflow
+
+slab:
+  geometry: slab.vasp           # VASP POSCAR/CONTCAR
+  energy: -125.0                # DFT energy of bare slab (eV)
+  sampling_zmin: 10.0           # Min z for adsorbate placement (Å)
+  sampling_zmax: 15.0           # Max z for adsorbate placement (Å)
+
+adsorbates:
+  - symbol: O
+    chemical_potential: -4.92
+    n_orientations: 1
+    min_count: 0
+    max_count: 4
+
+  - symbol: OH
+    chemical_potential: -3.75
+    n_orientations: 3
+    min_count: 0
+    max_count: 3
+
+calculator_stages:
+  # Stage 1: Fast pre-optimization with MACE
+  - name: mace_preopt
+    type: mace
+    fmax: 0.10
+    max_steps: 300
+
+  # Stage 2: Coarse VASP relaxation
+  - name: vasp_coarse
+    type: vasp
+    fmax: 0.05
+    max_steps: 100
+    incar:
+      ENCUT: 400
+      EDIFF: 1.0e-5
+      ISMEAR: 0
+      SIGMA: 0.05
+
+  # Stage 3: Fine VASP relaxation (for fitness evaluation)
+  - name: vasp_fine
+    type: vasp
+    fmax: 0.02
+    max_steps: 100
+    incar:
+      ENCUT: 520
+      EDIFF: 1.0e-6
+      ISMEAR: 0
+      SIGMA: 0.05
+
+scheduler:
+  type: local              # local | slurm | pbs
+  nworkers: 4             # Max concurrent jobs
+  walltime: "01:00:00"    # HH:MM:SS
+
+ga:
+  population_size: 20
+  max_generations: 100
+  min_generations: 5
+  max_stall_generations: 10
+  min_adsorbates: 1
+  max_adsorbates: 7
+
+conditions:
+  temperature: 298.15     # K
+  pressure: 1.0          # atm
+  potential: 0.0         # V vs RHE
+  pH: 0.0
+
+fingerprint:
+  r_cut: 6.0
+  n_max: 8
+  l_max: 6
+  duplicate_threshold: 0.90
+
+mace_model: medium        # small | medium | large
+mace_device: cpu          # cpu | cuda | auto
