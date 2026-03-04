@@ -35,6 +35,7 @@ class AdsorbateConfig(BaseModel):
     n_orientations: int = Field(default=1, ge=1)
     min_count: int = Field(default=0, ge=0)
     max_count: int = Field(default=5, ge=0)
+    binding_index: int = Field(default=0, ge=0, description="Index of the surface-binding atom")
     geometry: str | None = Field(default=None, description="Path to geometry file")
     coordinates: list[list[float]] | None = Field(default=None)
 
@@ -42,6 +43,17 @@ class AdsorbateConfig(BaseModel):
     def _max_ge_min(self) -> AdsorbateConfig:
         if self.max_count < self.min_count:
             raise ValueError("max_count must be >= min_count")
+        return self
+
+    @model_validator(mode="after")
+    def _require_geometry_for_polyatomic(self) -> AdsorbateConfig:
+        from galoop.science.surface import parse_formula
+        if len(parse_formula(self.symbol)) > 1:
+            if self.geometry is None and self.coordinates is None:
+                raise ValueError(
+                    f"Adsorbate '{self.symbol}' has multiple atoms; "
+                    "specify 'geometry' (file path) or 'coordinates' (inline positions) in the config"
+                )
         return self
 
 
@@ -53,6 +65,10 @@ class StageConfig(BaseModel):
     energy_per_atom_tol: float = Field(default=10.0, gt=0.0)
     max_force_tol: float = Field(default=50.0, gt=0.0)
     incar: dict[str, Any] = Field(default_factory=dict)
+    fix_slab_first: bool = Field(default=False,
+        description="Pre-relax adsorbates with slab fully fixed before the main relax")
+    prescan_fmax: float | None = Field(default=None, gt=0.0,
+        description="Force cutoff for the prescan (defaults to fmax if unset)")
 
     @field_validator("type")
     @classmethod
@@ -83,6 +99,12 @@ class FingerprintConfig(BaseModel):
     n_max: int = Field(default=8, ge=1)
     l_max: int = Field(default=6, ge=0)
     duplicate_threshold: float = Field(default=0.90, gt=0.0, le=1.0)
+    energy_tol_pct: float = Field(default=5.0, ge=0.0,
+        description="Energy gate: max % difference relative to existing structure")
+    dist_hist_bins: int = Field(default=50, ge=10,
+        description="Number of bins for pairwise distance histogram")
+    dist_hist_threshold: float = Field(default=0.95, ge=0.0, le=1.0,
+        description="Min cosine similarity for distance histogram gate")
 
 
 class GAConfig(BaseModel):
@@ -125,8 +147,18 @@ class GaloopConfig(BaseModel):
     ga: GAConfig = Field(default_factory=GAConfig)
     conditions: ConditionsConfig = Field(default_factory=ConditionsConfig)
     fingerprint: FingerprintConfig = Field(default_factory=FingerprintConfig)
-    mace_model: str = Field(default="medium")
+    mace_model: str = Field(
+        default="medium",
+        description=(
+            "MACE model identifier ('small', 'medium', 'large', 'medium-0b3', …) "
+            "or an absolute/relative path to a custom .pt model file."
+        ),
+    )
     mace_device: str = Field(default="cpu")
+    mace_dtype: str = Field(
+        default="float32",
+        description="Floating-point dtype for MACE ('float32' or 'float64').",
+    )
 
     @field_validator("mace_device")
     @classmethod
@@ -134,6 +166,13 @@ class GaloopConfig(BaseModel):
         v = v.lower()
         if v not in ("cpu", "cuda", "auto"):
             raise ValueError(f"mace_device must be cpu/cuda/auto, got '{v}'")
+        return v
+
+    @field_validator("mace_dtype")
+    @classmethod
+    def _valid_dtype(cls, v: str) -> str:
+        if v not in ("float32", "float64"):
+            raise ValueError(f"mace_dtype must be float32 or float64, got '{v}'")
         return v
 
     @model_validator(mode="after")

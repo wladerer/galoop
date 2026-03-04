@@ -48,6 +48,8 @@ class CalculatorStage:
         energy_per_atom_tol: float = 10.0,
         max_force_tol: float = 50.0,
         incar: dict | None = None,
+        fix_slab_first: bool = False,
+        prescan_fmax: float | None = None,
         **extra,                         # absorb unknown keys from config
     ):
         self.name = name
@@ -57,6 +59,8 @@ class CalculatorStage:
         self.energy_per_atom_tol = energy_per_atom_tol
         self.max_force_tol = max_force_tol
         self.incar = incar or {}
+        self.fix_slab_first = fix_slab_first
+        self.prescan_fmax = prescan_fmax if prescan_fmax is not None else fmax
 
     def run(
         self,
@@ -64,19 +68,48 @@ class CalculatorStage:
         struct_dir: Path,
         mace_model: str = "medium",
         mace_device: str = "cpu",
+        mace_dtype: str = "float32",
+        n_slab_atoms: int = 0,
     ) -> StageResult:
         """
         Relax *atoms* with this stage's calculator.
 
         Writes ``CONTCAR`` inside ``struct_dir/stage_{name}/``.
         """
+        from ase.constraints import FixAtoms
+
         stage_dir = Path(struct_dir) / f"stage_{self.name}"
         stage_dir.mkdir(parents=True, exist_ok=True)
         log.debug("Running %s in %s", self.name, stage_dir)
 
+        if self.fix_slab_first and n_slab_atoms > 0 and n_slab_atoms < len(atoms):
+            prescan_dir = Path(struct_dir) / f"stage_{self.name}_prescan"
+            prescan_dir.mkdir(parents=True, exist_ok=True)
+
+            prescan_atoms = atoms.copy()
+            prescan_atoms.set_constraint(FixAtoms(indices=list(range(n_slab_atoms))))
+
+            log.debug("Prescan (adsorbates-only) for %s in %s (fmax=%.4f)", self.name, prescan_dir, self.prescan_fmax)
+            try:
+                if self.calc_type == "mace":
+                    self._run_mace(prescan_atoms, prescan_dir, mace_model, mace_device, mace_dtype, fmax=self.prescan_fmax)
+                elif self.calc_type == "vasp":
+                    self._run_vasp(prescan_atoms, prescan_dir, fmax=self.prescan_fmax)
+            except Exception as exc:
+                log.warning("%s prescan failed (%s) — proceeding with original geometry", self.name, exc)
+            else:
+                prescan_contcar = prescan_dir / "CONTCAR"
+                if prescan_contcar.exists():
+                    try:
+                        loaded = read(str(prescan_contcar), format="vasp")
+                        loaded.set_constraint(atoms.constraints)
+                        atoms = loaded
+                    except Exception as exc:
+                        log.warning("Failed to load prescan CONTCAR: %s", exc)
+
         try:
             if self.calc_type == "mace":
-                return self._run_mace(atoms, stage_dir, mace_model, mace_device)
+                return self._run_mace(atoms, stage_dir, mace_model, mace_device, mace_dtype)
             elif self.calc_type == "vasp":
                 return self._run_vasp(atoms, stage_dir)
             else:
@@ -93,20 +126,29 @@ class CalculatorStage:
         stage_dir: Path,
         mace_model: str,
         mace_device: str,
+        mace_dtype: str = "float32",
+        fmax: float | None = None,
     ) -> StageResult:
-        """Relax with a MACE-MP foundation model."""
+        """Relax with a MACE calculator (foundation model or custom .pt file)."""
+        from pathlib import Path as _Path
         try:
-            from mace.calculators import mace_mp
+            model_path = _Path(mace_model)
+            if model_path.exists():
+                # Custom / fine-tuned model file → use MACECalculator directly
+                from mace.calculators import MACECalculator
+                calc = MACECalculator(
+                    model_paths=str(model_path),
+                    device=mace_device,
+                    default_dtype=mace_dtype,
+                )
+            else:
+                # Named foundation model ("small", "medium", "large", "medium-0b3", …)
+                from mace.calculators import mace_mp
+                calc = mace_mp(model=mace_model, device=mace_device, default_dtype=mace_dtype)
         except ImportError as exc:
             raise ImportError(
-                "MACE-MP requires mace-torch.  Install with: pip install mace-torch"
+                "MACE requires mace-torch.  Install with: pip install mace-torch"
             ) from exc
-
-        calc = mace_mp(
-            model=mace_model,          # "small", "medium", or "large"
-            device=mace_device,
-            default_dtype="float32",
-        )
         atoms = atoms.copy()
         atoms.calc = calc
 
@@ -119,7 +161,7 @@ class CalculatorStage:
         )
 
         try:
-            converged = dyn.run(fmax=self.fmax, steps=self.max_steps)
+            converged = dyn.run(fmax=fmax if fmax is not None else self.fmax, steps=self.max_steps)
         except Exception as exc:
             log.warning("MACE relax failed: %s", exc)
             converged = False
@@ -147,7 +189,7 @@ class CalculatorStage:
 
     # -- VASP --------------------------------------------------------------
 
-    def _run_vasp(self, atoms: Atoms, stage_dir: Path) -> StageResult:
+    def _run_vasp(self, atoms: Atoms, stage_dir: Path, fmax: float | None = None) -> StageResult:
         """Relax with VASP via ASE's Vasp calculator."""
         from ase.calculators.vasp import Vasp
 
@@ -162,7 +204,7 @@ class CalculatorStage:
             "lcharg": False,
             "ibrion": 2,
             "nsw": self.max_steps,
-            "ediffg": -self.fmax,
+            "ediffg": -(fmax if fmax is not None else self.fmax),
             "ediff": 1e-5,
         }
         for key, val in self.incar.items():
@@ -228,6 +270,8 @@ class Pipeline:
         struct_dir: Path,
         mace_model: str = "medium",
         mace_device: str = "cpu",
+        mace_dtype: str = "float32",
+        n_slab_atoms: int = 0,
     ) -> dict:
         """
         Run all stages sequentially.
@@ -250,7 +294,8 @@ class Pipeline:
         for stage in self.stages:
             result = stage.run(
                 current_atoms, struct_dir,
-                mace_model=mace_model, mace_device=mace_device,
+                mace_model=mace_model, mace_device=mace_device, mace_dtype=mace_dtype,
+                n_slab_atoms=n_slab_atoms,
             )
             stage_results[stage.name] = result
 

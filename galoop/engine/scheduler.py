@@ -69,7 +69,7 @@ class LocalScheduler(Scheduler):
         job_id = f"local_{self._next_id:06d}"
         self._next_id += 1
 
-        workdir = Path(workdir)
+        workdir = Path(workdir).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
 
         script_file = workdir / "run_job.sh"

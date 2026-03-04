@@ -17,6 +17,9 @@ env/
 .idea/
 .vscode/
 
+# Claude Code
+.claude/
+
 # Project-specific
 gocia.db
 *.db

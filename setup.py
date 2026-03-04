@@ -16,6 +16,7 @@ setup(
         "pydantic>=2.0",
         "pyyaml>=6.0",
         "click>=8.0",
+        "plotly>=5.0",
         "dscribe>=1.2",
         "torch>=2.0",
         "mace-torch>=0.3",

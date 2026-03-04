@@ -87,22 +87,6 @@ def _count_protons(adsorbate_counts: dict[str, int]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Desorption check (energy-independent, geometry-based)
-# ---------------------------------------------------------------------------
-
-def is_desorbed(
-    atoms,
-    slab_info,
-    z_threshold: float = 15.0,
-) -> bool:
-    """Return ``True`` if any adsorbate atom is above *z_threshold*."""
-    if len(atoms) <= slab_info.n_slab_atoms:
-        return False
-    ads_z = atoms.get_positions()[slab_info.n_slab_atoms:, 2]
-    return bool(np.any(ads_z > z_threshold))
-
-
-# ---------------------------------------------------------------------------
 # Approximate ZPE placeholder
 # ---------------------------------------------------------------------------
 

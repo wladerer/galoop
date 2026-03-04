@@ -20,6 +20,148 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Viridis colormap key points (R, G, B)
+_VIRIDIS = [
+    (68,  1,  84), (72, 40, 120), (62, 74, 137), (49, 104, 142),
+    (38, 130, 142), (31, 158, 137), (53, 183, 121), (110, 206, 88),
+    (181, 222, 43), (253, 231, 37),
+]
+
+
+def _viridis(t: float) -> str:
+    t = max(0.0, min(1.0, t))
+    n = len(_VIRIDIS) - 1
+    lo = int(t * n)
+    hi = min(lo + 1, n)
+    f = t * n - lo
+    r = int(_VIRIDIS[lo][0] * (1 - f) + _VIRIDIS[hi][0] * f)
+    g = int(_VIRIDIS[lo][1] * (1 - f) + _VIRIDIS[hi][1] * f)
+    b = int(_VIRIDIS[lo][2] * (1 - f) + _VIRIDIS[hi][2] * f)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _collect_adsorbate_xy(df, n_slab_atoms: int) -> list[tuple[float, float]]:
+    """Return fractional (x, y) positions of all adsorbate atoms across all structures."""
+    try:
+        import numpy as np
+        from ase.io import read as ase_read
+    except ImportError:
+        return []
+
+    xys: list[tuple[float, float]] = []
+    for _, row in df.iterrows():
+        gpath = row.get("geometry_path")
+        if not gpath:
+            continue
+        gpath = Path(gpath)
+        target = gpath.parent / "CONTCAR"
+        if not target.exists():
+            target = gpath.parent / "POSCAR"
+        if not target.exists():
+            continue
+        try:
+            atoms = ase_read(str(target), format="vasp")
+            if len(atoms) <= n_slab_atoms:
+                continue
+            cell_inv = np.linalg.inv(atoms.cell[:].T)
+            for pos in atoms[n_slab_atoms:].get_positions():
+                frac = cell_inv @ pos
+                fx, fy = float(frac[0] % 1.0), float(frac[1] % 1.0)
+                if np.isfinite(fx) and np.isfinite(fy):
+                    xys.append((fx, fy))
+        except Exception:
+            pass
+    return xys
+
+
+def _svg_heatmap(
+    xys: list[tuple[float, float]],
+    a_len: float,
+    b_len: float,
+    n_bins: int = 30,
+    width: int = 560,
+    height: int = 320,
+) -> str:
+    import numpy as np
+
+    pad_l, pad_r, pad_t, pad_b = 50, 80, 24, 36
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    if not xys:
+        return (
+            f'<svg width="{width}" height="{height}" '
+            f'style="background:#1e2a3a;border-radius:6px">'
+            f'<text x="{width//2}" y="{height//2}" text-anchor="middle" '
+            f'fill="#888" font-size="14">No adsorbate positions found</text></svg>'
+        )
+
+    hist = np.zeros((n_bins, n_bins), dtype=int)
+    for fx, fy in xys:
+        ix = min(int(fx * n_bins), n_bins - 1)
+        iy = min(int(fy * n_bins), n_bins - 1)
+        hist[iy, ix] += 1
+
+    max_count = int(hist.max()) or 1
+    bw = plot_w / n_bins
+    bh = plot_h / n_bins
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'style="background:#1e2a3a;border-radius:6px">',
+    ]
+
+    for iy in range(n_bins):
+        for ix in range(n_bins):
+            t = hist[iy, ix] / max_count
+            x = pad_l + ix * bw
+            y = pad_t + iy * bh
+            lines.append(
+                f'<rect x="{x:.2f}" y="{y:.2f}" '
+                f'width="{bw:.2f}" height="{bh:.2f}" fill="{_viridis(t)}"/>'
+            )
+
+    # Cell outline
+    lines.append(
+        f'<rect x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" '
+        f'fill="none" stroke="#aaa" stroke-width="1"/>'
+    )
+
+    # Axis labels
+    lines += [
+        f'<text x="{pad_l + plot_w / 2}" y="{height - 4}" '
+        f'text-anchor="middle" fill="#aaa" font-size="11">a ({a_len:.2f} Å)</text>',
+        f'<text x="12" y="{pad_t + plot_h / 2}" text-anchor="middle" fill="#aaa" font-size="11" '
+        f'transform="rotate(-90,12,{pad_t + plot_h / 2})">b ({b_len:.2f} Å)</text>',
+        f'<text x="{pad_l + plot_w // 2}" y="{pad_t - 6}" '
+        f'text-anchor="middle" fill="#7a90a8" font-size="10">'
+        f'{len(xys)} adsorbate atom positions</text>',
+    ]
+
+    # Colorbar
+    cb_x = pad_l + plot_w + 10
+    cb_w, n_stops = 14, 20
+    for i in range(n_stops):
+        t = i / n_stops
+        seg_h = plot_h / n_stops + 1
+        y = pad_t + (1.0 - t) * plot_h
+        lines.append(
+            f'<rect x="{cb_x}" y="{y:.2f}" width="{cb_w}" height="{seg_h:.2f}" '
+            f'fill="{_viridis(t)}"/>'
+        )
+    lines += [
+        f'<text x="{cb_x + cb_w + 4}" y="{pad_t + 4}" '
+        f'fill="#888" font-size="9" dominant-baseline="middle">{max_count}</text>',
+        f'<text x="{cb_x + cb_w + 4}" y="{pad_t + plot_h // 2}" '
+        f'fill="#888" font-size="9" dominant-baseline="middle">{max_count // 2}</text>',
+        f'<text x="{cb_x + cb_w + 4}" y="{pad_t + plot_h}" '
+        f'fill="#888" font-size="9" dominant-baseline="middle">0</text>',
+    ]
+
+    lines.append("</svg>")
+    return "\n".join(lines)
+
+
 _STATUS_COLOR = {
     "converged": "#2ecc71",
     "pending":   "#3498db",
@@ -399,6 +541,28 @@ def generate(
 
     dup_threshold = cfg.fingerprint.duplicate_threshold
 
+    # Load slab to determine n_slab_atoms and cell dimensions for the heatmap
+    n_slab_atoms = 0
+    a_len = b_len = 0.0
+    try:
+        import numpy as np
+        from ase.io import read as ase_read
+        slab_path = Path(cfg.slab.geometry)
+        if not slab_path.is_absolute():
+            slab_path = db_path.parent / slab_path
+        if slab_path.exists():
+            _slab = ase_read(str(slab_path), format="vasp")
+            n_slab_atoms = len(_slab)
+            a_len = float(np.linalg.norm(_slab.cell[0]))
+            b_len = float(np.linalg.norm(_slab.cell[1]))
+    except Exception as exc:
+        log.debug("Could not load slab for heatmap: %s", exc)
+
+    heatmap_svg = _svg_heatmap(
+        _collect_adsorbate_xy(df, n_slab_atoms),
+        a_len, b_len,
+    )
+
     total = sum(counts.values())
     n_conv = counts.get("converged", 0)
     n_failed = counts.get("failed", 0)
@@ -484,6 +648,16 @@ def generate(
     Green line — running minimum
   </p>
   {gce_svg}
+</div>
+
+<!-- ── Sampling heatmap ── -->
+<div class="section card">
+  <h2>Adsorbate sampling coverage</h2>
+  <p style="color:#7a90a8;font-size:0.82rem;margin-bottom:10px">
+    Fractional x–y positions of all adsorbate atoms across all structures
+    (CONTCAR preferred, POSCAR fallback) &nbsp;·&nbsp; viridis = visit count
+  </p>
+  {heatmap_svg}
 </div>
 
 <!-- ── Generation breakdown ── -->

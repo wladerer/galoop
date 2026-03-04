@@ -140,6 +140,7 @@ class Individual(BaseModel):
         copy = self.model_copy()
         copy.raw_energy = raw
         copy.grand_canonical_energy = grand_canonical
+        copy.status = STATUS.CONVERGED   
         return copy
 
     def with_weight(self, weight: float) -> Individual:

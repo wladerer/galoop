@@ -54,6 +54,12 @@ def row_to_individual(row: sqlite3.Row) -> Individual:
 # ---------------------------------------------------------------------------
 
 _SCHEMA = """\
+CREATE TABLE IF NOT EXISTS run_params (
+    id        INTEGER PRIMARY KEY,
+    config    TEXT    NOT NULL,
+    saved_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS structures (
     id                      TEXT PRIMARY KEY,
     generation              INTEGER NOT NULL,
@@ -79,6 +85,69 @@ BEGIN
     UPDATE structures SET updated_at = datetime('now') WHERE id = NEW.id;
 END;
 """
+
+
+# ---------------------------------------------------------------------------
+# Config snapshot helpers
+# ---------------------------------------------------------------------------
+
+# Fields whose change invalidates energy comparisons across runs
+_ENERGY_CRITICAL: frozenset[str] = frozenset({
+    "slab.energy",
+    "conditions.potential",
+    "conditions.pH",
+    "conditions.temperature",
+    "conditions.pressure",
+})
+
+
+def _flatten_config(cfg: dict) -> dict[str, object]:
+    """
+    Flatten a nested config dict into dotted-key form suitable for diffing.
+
+    Adsorbates and calculator stages are keyed by their name/symbol so that
+    reordering them in the YAML does not produce spurious diffs.
+    """
+    flat: dict[str, object] = {}
+    for k, v in cfg.items():
+        if k == "adsorbates" and isinstance(v, list):
+            for ads in v:
+                sym = ads.get("symbol", "?")
+                for ak, av in ads.items():
+                    flat[f"adsorbates.{sym}.{ak}"] = av
+        elif k == "calculator_stages" and isinstance(v, list):
+            for stage in v:
+                name = stage.get("name", "?")
+                for sk, sv in stage.items():
+                    flat[f"calculator_stages.{name}.{sk}"] = sv
+        elif isinstance(v, dict):
+            for sk, sv in v.items():
+                flat[f"{k}.{sk}"] = sv
+        else:
+            flat[k] = v
+    return flat
+
+
+def diff_configs(stored: dict, current: dict) -> list[dict]:
+    """
+    Return a list of changed fields between two serialised configs.
+
+    Each entry is a dict with keys:
+        field           — dotted key path
+        old             — value in *stored*
+        new             — value in *current*
+        energy_critical — True if the change affects grand-canonical energies
+    """
+    s = _flatten_config(stored)
+    c = _flatten_config(current)
+    diffs = []
+    for key in sorted(set(s) | set(c)):
+        old = s.get(key, "<absent>")
+        new = c.get(key, "<absent>")
+        if old != new:
+            critical = key in _ENERGY_CRITICAL or "chemical_potential" in key
+            diffs.append({"field": key, "old": old, "new": new, "energy_critical": critical})
+    return diffs
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +286,27 @@ class GaloopDB:
             (f"%{substr}%",),
         ).fetchone()
         return row_to_individual(row) if row else None
+
+    # -- run parameter tracking --------------------------------------------
+
+    def save_run_params(self, config: dict) -> None:
+        """Snapshot *config* (a model_dump() dict) into the run_params table."""
+        with self._tx() as cur:
+            cur.execute("INSERT INTO run_params (config) VALUES (?)", (json.dumps(config),))
+
+    def load_run_params(self) -> dict | None:
+        """Return the most recent stored config snapshot, or None."""
+        row = self._conn.execute(
+            "SELECT config FROM run_params ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def diff_run_params(self, current: dict) -> list[dict]:
+        """Compare *current* against the stored snapshot; return changed fields."""
+        stored = self.load_run_params()
+        if stored is None:
+            return []
+        return diff_configs(stored, current)
 
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.read_sql_query(

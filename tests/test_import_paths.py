@@ -78,11 +78,11 @@ class TestAllModulesImport:
     def test_surface(self):
         from galoop.science.surface import (
             load_slab, load_adsorbate, place_adsorbate,
-            parse_formula, check_clash, detect_desorption,
+            parse_formula, check_clash, detect_desorption, orient_upright,
         )
 
     def test_energy(self):
-        from galoop.science.energy import grand_canonical_energy, is_desorbed
+        from galoop.science.energy import grand_canonical_energy
 
     def test_reproduce(self):
         from galoop.science.reproduce import splice, merge, mutate_add, mutate_remove, mutate_displace

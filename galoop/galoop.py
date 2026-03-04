@@ -16,7 +16,10 @@ from ase.io import read, write
 
 from galoop.individual import Individual, STATUS, OPERATOR
 from galoop.database import GaloopDB
-from galoop.fingerprint import classify_postrelax, compute_soap
+from galoop.fingerprint import (
+    classify_postrelax, compute_soap, tanimoto_similarity,
+    StructRecord, _dist_histogram, _composition, build_chem_envs,
+)
 from galoop.science.reproduce import splice, merge, mutate_add, mutate_remove
 
 log = logging.getLogger(__name__)
@@ -66,13 +69,20 @@ def run(
             _build_initial_population(config, slab_info, db, run_dir, rng)
 
         active_jobs: dict[str, str] = {}   # struct_key → job_id
-        soap_cache: dict[str, np.ndarray] = {}
+        struct_cache: dict[str, StructRecord] = {}
         best_gce = float("inf")
         stall_count = 0
         total_evals = len(db.get_by_status(STATUS.CONVERGED))
 
-        log.info("Resuming with %d converged structures.  Rebuilding SOAP cache …", total_evals)
-        _rebuild_soap_cache(run_dir, db, soap_cache, config)
+        log.info("Resuming with %d converged structures.  Rebuilding struct cache …", total_evals)
+        _rebuild_struct_cache(run_dir, db, struct_cache, config, slab_info.n_slab_atoms)
+
+        # Re-sync any structures left in 'submitted' from a previous session
+        total_evals, best_gce, stall_count = _reconcile_submitted_orphans(
+            run_dir, db, struct_cache, chem_pots, config,
+            total_evals, best_gce, stall_count,
+            n_slab_atoms=slab_info.n_slab_atoms,
+        )
 
         # ── main loop ─────────────────────────────────────────────────────
         while True:
@@ -104,8 +114,9 @@ def run(
 
                     if ind.status == STATUS.CONVERGED:
                         ind, total_evals, best_gce, stall_count = _handle_converged(
-                            ind, struct_dir, db, soap_cache, chem_pots,
+                            ind, struct_dir, db, struct_cache, chem_pots,
                             config, total_evals, best_gce, stall_count,
+                            n_slab_atoms=slab_info.n_slab_atoms,
                         )
                     elif STATUS.is_terminal(ind.status):
                         total_evals += 1
@@ -138,8 +149,9 @@ def run(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_converged(
-    ind, struct_dir, db, soap_cache, chem_pots,
+    ind, struct_dir, db, struct_cache, chem_pots,
     config, total_evals, best_gce, stall_count,
+    n_slab_atoms: int = 0,
 ):
     """Post-relax classification + energy for a converged structure."""
     from galoop.science.energy import grand_canonical_energy
@@ -151,24 +163,32 @@ def _handle_converged(
 
     try:
         atoms = read(str(contcar), format="vasp")
+        raw_e = _read_energy(struct_dir)
+
         label, dup_id, soap_vec = classify_postrelax(
-            atoms, soap_cache,
+            atoms,
+            energy=raw_e,
+            struct_cache=struct_cache,
             duplicate_threshold=config.fingerprint.duplicate_threshold,
+            energy_tol_pct=config.fingerprint.energy_tol_pct,
+            dist_hist_threshold=config.fingerprint.dist_hist_threshold,
+            dist_hist_bins=config.fingerprint.dist_hist_bins,
+            dist_hist_rmax=config.fingerprint.r_cut,
             r_cut=config.fingerprint.r_cut,
             n_max=config.fingerprint.n_max,
             l_max=config.fingerprint.l_max,
+            n_slab_atoms=n_slab_atoms,
         )
 
         if label == "duplicate":
-            sim = _best_similarity(soap_vec, soap_cache)
+            sim = _best_similarity(soap_vec, struct_cache)
             log.info("  %s: duplicate of %s  (Tanimoto=%.3f)", ind.id, dup_id, sim)
             ind = ind.mark_duplicate()
             ind.extra_data = {**ind.extra_data, "dup_of": dup_id, "tanimoto": float(sim)}
             db.update(ind)
         else:
-            sim = _best_similarity(soap_vec, soap_cache) if soap_cache else 0.0
+            sim = _best_similarity(soap_vec, struct_cache) if struct_cache else 0.0
             log.debug("  %s: unique  (best Tanimoto=%.3f)", ind.id, sim)
-            raw_e = _read_energy(struct_dir)
             gce = grand_canonical_energy(
                 raw_energy=raw_e,
                 adsorbate_counts=ind.extra_data.get("adsorbate_counts", {}),
@@ -180,7 +200,19 @@ def _handle_converged(
             )
             ind = ind.with_energy(raw=raw_e, grand_canonical=gce)
             db.update(ind)
-            soap_cache[ind.id] = soap_vec
+            record = StructRecord(
+                id=ind.id,
+                soap_vector=soap_vec,
+                energy=raw_e,
+                composition=_composition(atoms),
+                dist_hist=_dist_histogram(
+                    atoms,
+                    n_bins=config.fingerprint.dist_hist_bins,
+                    r_max=config.fingerprint.r_cut,
+                ),
+                chem_envs=build_chem_envs(atoms, n_slab_atoms) if n_slab_atoms > 0 else None,
+            )
+            struct_cache[ind.id] = record
 
             if gce < best_gce - 1e-6:
                 best_gce = gce
@@ -303,9 +335,33 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
         elif op == OPERATOR.MERGE:
             child = merge(parent_atoms[0], parent_atoms[1], slab_info.n_slab_atoms, rng=rng)
         elif op == OPERATOR.MUTATE_ADD:
-            # pick a random adsorbate symbol from config
-            sym = str(rng.choice([a.symbol for a in config.adsorbates]))
-            child = mutate_add(parent_atoms[0], slab_info.n_slab_atoms, sym, rng=rng)
+            from galoop.science.surface import load_adsorbate, place_adsorbate
+
+            parent_counts = parents[0].extra_data.get("adsorbate_counts", {})
+            if sum(parent_counts.values()) >= config.ga.max_adsorbates:
+                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+
+            # pick a random adsorbate symbol from config, respecting per-species max
+            addable = [
+                a.symbol for a in config.adsorbates
+                if parent_counts.get(a.symbol, 0) < a.max_count
+            ]
+            if not addable:
+                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+            sym = str(rng.choice(addable))
+            ads_cfg = next(a for a in config.adsorbates if a.symbol == sym)
+            ads_mol = load_adsorbate(
+                symbol=sym,
+                geometry=getattr(ads_cfg, "geometry", None),
+                coordinates=getattr(ads_cfg, "coordinates", None),
+            )
+            child = place_adsorbate(
+                parent_atoms[0], ads_mol,
+                slab_info.zmin, slab_info.zmax,
+                n_orientations=ads_cfg.n_orientations,
+                binding_index=ads_cfg.binding_index,
+                rng=rng,
+            )
         elif op == OPERATOR.MUTATE_REMOVE:
             result = mutate_remove(parent_atoms[0], slab_info.n_slab_atoms, rng=rng)
             if result is None:
@@ -314,6 +370,16 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
         else:
             return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
 
+        # Reject offspring that violate total adsorbate bounds (can happen after splice/merge)
+        if op in (OPERATOR.SPLICE, OPERATOR.MERGE):
+            trial_counts = _infer_adsorbate_counts(
+                child.get_chemical_symbols()[slab_info.n_slab_atoms:],
+                config.adsorbates,
+            )
+            total = sum(trial_counts.values())
+            if total > config.ga.max_adsorbates or total < config.ga.min_adsorbates:
+                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+
         bucket_dir.mkdir(parents=True, exist_ok=True)
         struct_n = len(sorted(bucket_dir.glob("struct_????"))) + 1
         struct_dir = bucket_dir / f"struct_{struct_n:04d}"
@@ -321,7 +387,10 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
         poscar = struct_dir / "POSCAR"
         write(str(poscar), child, format="vasp")
 
-        ads_counts = dict(Counter(child.get_chemical_symbols()[slab_info.n_slab_atoms:]))
+        ads_counts = _infer_adsorbate_counts(
+            child.get_chemical_symbols()[slab_info.n_slab_atoms:],
+            config.adsorbates,
+        )
         ind = Individual.from_parents(
             generation=int(bucket_dir.name.split("_")[1]),
             parents=parents,
@@ -479,22 +548,75 @@ def _sample_operator(rng) -> str:
     return str(rng.choice(ops, p=probs))
 
 
-def _rebuild_soap_cache(run_dir, db, soap_cache, config):
+def _reconcile_submitted_orphans(run_dir, db, struct_cache, chem_pots, config,
+                                  total_evals, best_gce, stall_count,
+                                  n_slab_atoms: int = 0):
+    """
+    On resume, any structure still in 'submitted' state is an orphan — the
+    scheduler no longer knows about it.  Re-read the filesystem sentinel and:
+      - CONVERGED  → run through _handle_converged (compute GCE, dup-check)
+      - FAILED / DESORBED / DUPLICATE → update DB status
+      - anything else → reset to PENDING so it gets resubmitted
+    """
+    orphans = db.get_by_status(STATUS.SUBMITTED)
+    if not orphans:
+        return total_evals, best_gce, stall_count
+
+    log.info("Reconciling %d submitted orphan(s) from previous session …", len(orphans))
+    for ind in orphans:
+        if not ind.geometry_path:
+            continue
+        struct_dir = Path(ind.geometry_path).parent
+        sentinel = _read_sentinel(struct_dir)
+        if sentinel == STATUS.CONVERGED:
+            ind, total_evals, best_gce, stall_count = _handle_converged(
+                ind, struct_dir, db, struct_cache, chem_pots,
+                config, total_evals, best_gce, stall_count,
+                n_slab_atoms=n_slab_atoms,
+            )
+        elif sentinel in (STATUS.FAILED, STATUS.DESORBED, STATUS.DUPLICATE):
+            ind = ind.with_status(sentinel)
+            db.update(ind)
+            total_evals += 1
+            log.debug("  Reconciled %s → %s", struct_dir.name, sentinel)
+        else:
+            ind = ind.with_status(STATUS.PENDING)
+            _write_sentinel(struct_dir, STATUS.PENDING)
+            db.update(ind)
+            log.debug("  Reset %s → pending (orphaned submitted)", struct_dir.name)
+
+    return total_evals, best_gce, stall_count
+
+
+def _rebuild_struct_cache(run_dir, db, struct_cache, config, n_slab_atoms: int = 0):
     for ind in db.get_by_status(STATUS.CONVERGED):
         if not ind.geometry_path:
             continue
         contcar = Path(ind.geometry_path).parent / "CONTCAR"
-        if contcar.exists():
-            try:
-                atoms = read(str(contcar), format="vasp")
-                soap_cache[ind.id] = compute_soap(
+        if not contcar.exists():
+            continue
+        try:
+            atoms = read(str(contcar), format="vasp")
+            soap_vec = compute_soap(
+                atoms,
+                r_cut=config.fingerprint.r_cut,
+                n_max=config.fingerprint.n_max,
+                l_max=config.fingerprint.l_max,
+            )
+            struct_cache[ind.id] = StructRecord(
+                id=ind.id,
+                soap_vector=soap_vec,
+                energy=ind.raw_energy,
+                composition=_composition(atoms),
+                dist_hist=_dist_histogram(
                     atoms,
-                    r_cut=config.fingerprint.r_cut,
-                    n_max=config.fingerprint.n_max,
-                    l_max=config.fingerprint.l_max,
-                )
-            except Exception as exc:
-                log.debug("Could not load SOAP for %s: %s", ind.id, exc)
+                    n_bins=config.fingerprint.dist_hist_bins,
+                    r_max=config.fingerprint.r_cut,
+                ),
+                chem_envs=build_chem_envs(atoms, n_slab_atoms) if n_slab_atoms > 0 else None,
+            )
+        except Exception as exc:
+            log.debug("Could not rebuild record for %s: %s", ind.id, exc)
 
 
 def _should_stop(total_evals, stall_count, config):
@@ -520,7 +642,10 @@ def _key_to_dir(key, run_dir):
 
 
 def _find_ind_for_dir(struct_dir, db):
-    return db.find_by_geometry_path_substring(struct_dir.name)
+    # Include the generation folder to avoid matching same struct name across generations
+    return db.find_by_geometry_path_substring(
+        f"{struct_dir.parent.name}/{struct_dir.name}"
+    )
 
 
 def _read_energy(struct_dir):
@@ -548,9 +673,38 @@ def _read_sentinel(struct_dir):
     return None
 
 
-def _best_similarity(soap_vec: np.ndarray, soap_cache: dict) -> float:
+def _infer_adsorbate_counts(
+    element_symbols: list[str],
+    adsorbate_configs,
+) -> dict[str, int]:
+    """
+    Reconstruct molecular-level {symbol: count} from a flat element list.
+
+    Greedy, largest-formula-first, so 'OOH' is matched before 'O'.
+    Leftover atoms that don't complete a molecule are silently discarded
+    (can happen after splice/merge operations).
+    """
+    from galoop.science.surface import parse_formula
+
+    remaining = Counter(element_symbols)
+    counts: dict[str, int] = {}
+
+    for ads in sorted(adsorbate_configs, key=lambda a: -len(parse_formula(a.symbol))):
+        formula_elems = Counter(parse_formula(ads.symbol))
+        if not formula_elems:
+            continue
+        n = min(remaining[e] // c for e, c in formula_elems.items())
+        if n > 0:
+            counts[ads.symbol] = n
+            for e, c in formula_elems.items():
+                remaining[e] -= n * c
+
+    return counts
+
+
+def _best_similarity(soap_vec: np.ndarray, struct_cache: dict) -> float:
     """Return the highest Tanimoto similarity between soap_vec and anything in cache."""
-    from galoop.fingerprint import tanimoto_similarity
-    if not soap_cache:
+    if not struct_cache:
         return 0.0
-    return max(tanimoto_similarity(soap_vec, v) for v in soap_cache.values())
+    return max(tanimoto_similarity(soap_vec, rec.soap_vector)
+               for rec in struct_cache.values())

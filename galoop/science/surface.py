@@ -14,7 +14,7 @@ from typing import NamedTuple
 import numpy as np
 from ase import Atoms
 from ase.constraints import FixAtoms
-from ase.io import read, write
+from ase.io import read
 from ase.neighborlist import NeighborList, natural_cutoffs
 
 log = logging.getLogger(__name__)
@@ -58,18 +58,25 @@ def load_slab(
         raise FileNotFoundError(f"Slab geometry not found: {geometry_path}")
 
     atoms = read(str(geometry_path), format="vasp")
+    n_slab = len(atoms)
 
-    z_coords = atoms.get_positions()[:, 2]
-    slab_mask = z_coords < zmin
-    n_slab = int(np.sum(slab_mask))
-
-    if n_slab == 0:
-        log.warning("No atoms below zmin=%.1f — treating all atoms as slab", zmin)
-        n_slab = len(atoms)
-        slab_mask = np.ones(len(atoms), dtype=bool)
-
-    atoms.set_constraint(FixAtoms(indices=np.where(slab_mask)[0]))
-    log.info("Fixed %d slab atoms (z < %.1f Å)", n_slab, zmin)
+    if atoms.constraints:
+        log.info("Loaded slab with %d atoms; using selective dynamics from POSCAR", n_slab)
+    else:
+        z_coords = atoms.get_positions()[:, 2]
+        fixed_mask = z_coords < zmin
+        n_fixed = int(np.sum(fixed_mask))
+        if n_fixed > 0:
+            atoms.set_constraint(FixAtoms(indices=np.where(fixed_mask)[0]))
+            log.info(
+                "No selective dynamics in POSCAR; fixed %d atoms (z < %.1f Å)",
+                n_fixed, zmin,
+            )
+        else:
+            log.warning(
+                "No selective dynamics and no atoms below zmin=%.1f — slab atoms will be unconstrained",
+                zmin,
+            )
 
     return SlabInfo(
         atoms=atoms,
@@ -92,7 +99,10 @@ def load_adsorbate(
     """
     Load or build an adsorbate :class:`Atoms` object.
 
-    Priority: *geometry* file > inline *coordinates* > ASE molecule DB > single atom.
+    Priority: *geometry* file > inline *coordinates* > single atom (monoatomic only).
+
+    Multi-atom species must supply either *geometry* or *coordinates*; passing
+    neither raises a :exc:`ValueError`.
     """
     if geometry is not None:
         p = Path(geometry)
@@ -112,22 +122,14 @@ def load_adsorbate(
             )
         return Atoms(symbols=symbols, positions=coords)
 
-    # Fall back to ASE molecule database, then single atom
-    return _minimal_geometry(symbol)
+    elems = parse_formula(symbol)
+    if len(elems) == 1:
+        return Atoms(elems)
 
-
-def _minimal_geometry(symbol: str) -> Atoms:
-    """Best-effort geometry from ASE's molecule DB or a lone atom."""
-    from ase.build import molecule
-
-    try:
-        atoms = molecule(symbol)
-    except Exception:
-        elems = parse_formula(symbol)
-        atoms = Atoms(elems[0] if elems else "H")
-
-    atoms.center(vacuum=3.0)
-    return atoms
+    raise ValueError(
+        f"Adsorbate '{symbol}' has multiple atoms; "
+        "specify 'geometry' (file path) or 'coordinates' (inline positions) in the config"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +172,70 @@ def parse_formula(formula: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Adsorbate orientation
+# ---------------------------------------------------------------------------
+
+def _rotation_to(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """3×3 rotation matrix that rotates unit vector *src* onto *dst*."""
+    c = float(np.dot(src, dst))
+    if c > 1.0 - 1e-10:
+        return np.eye(3)
+    if c < -1.0 + 1e-10:
+        # 180° rotation — pick any axis perpendicular to src
+        perp = np.cross(src, np.array([1.0, 0.0, 0.0]))
+        if np.linalg.norm(perp) < 1e-10:
+            perp = np.cross(src, np.array([0.0, 1.0, 0.0]))
+        perp /= np.linalg.norm(perp)
+        return 2.0 * np.outer(perp, perp) - np.eye(3)
+    v = np.cross(src, dst)
+    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + vx + vx @ vx / (1.0 + c)
+
+
+def orient_upright(adsorbate: Atoms, binding_index: int = 0) -> Atoms:
+    """
+    Return a copy of *adsorbate* rotated so that the atom at *binding_index*
+    points toward the surface (−z direction).
+
+    For a single-atom adsorbate this is a no-op.  For multi-atom species
+    the molecule is rotated so the binding atom sits at minimum z, ready
+    to adsorb.
+
+    Parameters
+    ----------
+    adsorbate     : molecule to orient
+    binding_index : index of the atom that binds to the surface (default 0)
+
+    Examples
+    --------
+    OH  → ``binding_index=0`` puts O down, H up
+    OOH → ``binding_index=0`` puts first O down
+    H₂O → ``binding_index=1`` would put O down if the formula is H₂O
+    """
+    if len(adsorbate) <= 1:
+        return adsorbate.copy()
+
+    if binding_index >= len(adsorbate):
+        raise ValueError(
+            f"binding_index={binding_index} out of range for adsorbate with "
+            f"{len(adsorbate)} atoms"
+        )
+
+    ads = adsorbate.copy()
+    pos = ads.get_positions()
+    com = ads.get_center_of_mass()
+
+    v = pos[binding_index] - com
+    norm = np.linalg.norm(v)
+    if norm < 1e-10:
+        return ads      # binding atom coincides with COM — nothing to do
+
+    rot = _rotation_to(v / norm, np.array([0.0, 0.0, -1.0]))
+    ads.set_positions((pos - com) @ rot.T + com)
+    return ads
+
+
+# ---------------------------------------------------------------------------
 # Adsorbate placement
 # ---------------------------------------------------------------------------
 
@@ -179,8 +245,9 @@ def place_adsorbate(
     zmin: float,
     zmax: float,
     n_orientations: int = 1,
+    binding_index: int = 0,
     rng: np.random.Generator | None = None,
-    clash_scale: float = 0.7,
+    clash_scale: float = 0.85,
     max_attempts: int = 50,
 ) -> Atoms:
     """
@@ -189,9 +256,9 @@ def place_adsorbate(
     The adsorbate centre-of-mass is placed at a random (x, y) inside the
     unit cell and a random z in ``[zmin, zmax]``, then rotated around z.
     A clash check (via ASE :class:`NeighborList`) rejects placements where
-    atoms are closer than ``clash_scale × sum_of_covalent_radii``.  Up to
-    *max_attempts* placements are tried before accepting the last one with a
-    warning.
+    adsorbate atoms are closer than ``clash_scale × sum_of_covalent_radii``
+    to any other atom.  Up to *max_attempts* placements are tried before
+    accepting the last one with a warning.
 
     Parameters
     ----------
@@ -210,7 +277,16 @@ def place_adsorbate(
     if rng is None:
         rng = np.random.default_rng()
 
+    # Orient the binding atom toward the surface before placement.
+    adsorbate = orient_upright(adsorbate, binding_index=binding_index)
+
     cell = slab.get_cell()
+
+    # Capture slab size BEFORE any adsorbate is appended so check_clash
+    # knows which atom indices are slab atoms (and should be ignored).
+    n_slab_before = len(slab)
+
+    combined = slab.copy()  # initialise so the variable is always bound
 
     for attempt in range(max_attempts):
         # Random fractional xy, random z in window
@@ -235,7 +311,7 @@ def place_adsorbate(
         combined = slab.copy()
         combined.extend(ads)
 
-        if not check_clash(combined, scale=clash_scale):
+        if not check_clash(combined, n_slab=n_slab_before, scale=clash_scale):
             return combined
 
         log.debug("Placement attempt %d/%d clashed — retrying", attempt + 1, max_attempts)
@@ -254,33 +330,37 @@ def place_adsorbate(
 
 def check_clash(
     atoms: Atoms,
+    n_slab: int,
     scale: float = 0.7,
 ) -> bool:
     """
-    Return ``True`` if any two atoms are closer than *scale* × sum of their
-    natural (covalent) cutoffs.
+    Return ``True`` if any *adsorbate* atom is too close to any other atom.
+
+    Only adsorbate atoms (indices >= *n_slab*) are checked as sources of
+    clashes.  Intra-slab contacts are pre-existing and must not be flagged.
 
     Uses ASE's :class:`NeighborList` backed by a cell-list algorithm, so it
     runs in O(N) rather than the O(N²) naive double loop.
 
     Parameters
     ----------
-    atoms : structure to check
+    atoms : combined slab + adsorbate structure to check
+    n_slab : number of leading atoms that belong to the bare slab
     scale : fraction of covalent-radii sum to use as threshold.
             0.7 is a sensible default for surface adsorbate checks.
     """
+    if len(atoms) <= n_slab:
+        return False  # no adsorbate atoms present
+
     cutoffs = natural_cutoffs(atoms, mult=scale)
     nl = NeighborList(cutoffs, self_interaction=False, bothways=False, skin=0.0)
     nl.update(atoms)
 
-    for i in range(len(atoms)):
-        indices, offsets = nl.get_neighbors(i)
+    for i in range(n_slab, len(atoms)):
+        indices, _ = nl.get_neighbors(i)
         if len(indices) > 0:
-            # At least one neighbour within the scaled cutoff → clash
-            # But we need to verify the *actual* distance, because the
-            # NeighborList bins by cutoff_i + cutoff_j, which is already
-            # our scaled covalent sum.  So any hit is a clash.
-            return True
+            return True  # adsorbate atom has a neighbour within threshold
+
     return False
 
 
@@ -301,10 +381,10 @@ def detect_desorption(
     atoms : final relaxed structure
     slab_info : reference slab metadata
     z_threshold : Å above which an adsorbate is considered desorbed.
-                  Defaults to ``slab_info.zmax + 5.0``.
+                  Defaults to ``slab_info.zmax + 0.5``.
     """
     if z_threshold is None:
-        z_threshold = slab_info.zmax + 5.0
+        z_threshold = slab_info.zmax + 0.5
 
     if len(atoms) <= slab_info.n_slab_atoms:
         return False
