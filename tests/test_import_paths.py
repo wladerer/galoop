@@ -71,9 +71,9 @@ class TestAllModulesImport:
         from galoop.engine.calculator import Pipeline, CalculatorStage, build_pipeline
 
     def test_scheduler(self):
-        from galoop.engine.scheduler import (
-            Scheduler, LocalScheduler, SlurmScheduler, PbsScheduler, build_scheduler,
-        )
+        from galoop.engine.scheduler import relax_structure, build_parsl_config
+        assert callable(relax_structure)
+        assert callable(build_parsl_config)
 
     def test_surface(self):
         from galoop.science.surface import (

@@ -30,8 +30,8 @@ def _spawn_n(n, run_dir, db, config, slab_info, seed=7):
     from galoop.galoop import _spawn_one
     rng = np.random.default_rng(seed)
     results = []
-    for i in range(n):
-        ind = _spawn_one(run_dir, db, config, slab_info, rng, total_evals=i)
+    for _ in range(n):
+        ind = _spawn_one(run_dir, db, config, slab_info, rng)
         if ind is not None:
             results.append(ind)
     return results
@@ -56,8 +56,8 @@ class TestInitialPopulation:
 
     def test_pending_sentinels_written(self, tmp_path, minimal_config, slab_info, temp_db):
         _build_pop(minimal_config, slab_info, temp_db, tmp_path)
-        gen_dir = tmp_path / "gen_000"
-        struct_dirs = sorted(gen_dir.glob("struct_????"))
+        gcga_dir = tmp_path / "gcga"
+        struct_dirs = sorted(gcga_dir.glob("structure_?????"))
         assert len(struct_dirs) == minimal_config.ga.population_size
         for d in struct_dirs:
             assert (d / "PENDING").exists()
@@ -114,7 +114,7 @@ class TestSpawnOffspring:
         from galoop.database import GaloopDB
         db_path = tmp_path / "test.db"
         with GaloopDB(db_path) as db:
-            ind = _spawn_one(tmp_path, db, minimal_config, slab_info, rng, total_evals=0)
+            ind = _spawn_one(tmp_path, db, minimal_config, slab_info, rng)
         assert ind is not None
         assert Path(ind.geometry_path).exists()
 
@@ -153,7 +153,7 @@ class TestSpawnOffspring:
         from galoop.galoop import _spawn_one
         _build_pop(minimal_config, slab_info, temp_db, tmp_path)
         rng = np.random.default_rng(42)
-        ind = _spawn_one(tmp_path, temp_db, minimal_config, slab_info, rng, total_evals=0)
+        ind = _spawn_one(tmp_path, temp_db, minimal_config, slab_info, rng)
         assert ind is not None
         assert ind.operator == OPERATOR.INIT
 
@@ -167,12 +167,14 @@ class TestSpawnOffspring:
         }
         assert len(stoichiometries) > 1, "all offspring have identical stoichiometry"
 
-    def test_spawn_generation_increments(
+    def test_spawn_non_init_has_parent_ids(
         self, tmp_path, minimal_config, slab_info, temp_db, converged_population
     ):
-        offspring = _spawn_n(3, tmp_path, temp_db, minimal_config, slab_info)
-        for ind in offspring:
-            assert ind.generation >= 1
+        offspring = _spawn_n(20, tmp_path, temp_db, minimal_config, slab_info, seed=99)
+        ga_offspring = [o for o in offspring if o.operator != OPERATOR.INIT]
+        assert ga_offspring, "expected at least one GA operator offspring"
+        for ind in ga_offspring:
+            assert len(ind.parent_ids) >= 1
 
     def test_spawn_boltzmann_weights_realistic_energies(
         self, tmp_path, minimal_config, slab_info, temp_db
@@ -195,7 +197,7 @@ class TestSpawnOffspring:
         rng2 = np.random.default_rng(7)
         with warnings.catch_warnings():
             warnings.simplefilter("error")      # overflow → test failure
-            ind = _spawn_one(tmp_path, temp_db, minimal_config, slab_info, rng2, total_evals=0)
+            ind = _spawn_one(tmp_path, temp_db, minimal_config, slab_info, rng2)
 
         assert ind is not None
 

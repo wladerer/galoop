@@ -64,7 +64,6 @@ class Individual(BaseModel):
     Fields
     ------
     id : 8-char UUID fragment
-    generation : which generation this structure belongs to
     parent_ids : IDs of parent structures (empty for initial population)
     operator : which GA operator produced this structure
     status : current lifecycle state
@@ -78,7 +77,6 @@ class Individual(BaseModel):
     model_config = {"frozen": False}
 
     id: str = Field(default_factory=_short_uuid)
-    generation: int = 0
     parent_ids: list[str] = Field(default_factory=list)
     operator: str = OPERATOR.INIT
     status: str = STATUS.PENDING
@@ -95,13 +93,11 @@ class Individual(BaseModel):
     @classmethod
     def from_init(
         cls,
-        generation: int,
         geometry_path: str | None = None,
         extra_data: dict | None = None,
     ) -> Individual:
         """Create a structure for the initial random population."""
         return cls(
-            generation=generation,
             operator=OPERATOR.INIT,
             status=STATUS.PENDING,
             geometry_path=geometry_path,
@@ -111,7 +107,6 @@ class Individual(BaseModel):
     @classmethod
     def from_parents(
         cls,
-        generation: int,
         parents: list[Individual],
         operator: str,
         geometry_path: str | None = None,
@@ -119,7 +114,6 @@ class Individual(BaseModel):
     ) -> Individual:
         """Create an offspring from one or more parents."""
         return cls(
-            generation=generation,
             parent_ids=[p.id for p in parents],
             operator=operator,
             status=STATUS.PENDING,
@@ -140,7 +134,7 @@ class Individual(BaseModel):
         copy = self.model_copy()
         copy.raw_energy = raw
         copy.grand_canonical_energy = grand_canonical
-        copy.status = STATUS.CONVERGED   
+        copy.status = STATUS.CONVERGED
         return copy
 
     def with_weight(self, weight: float) -> Individual:

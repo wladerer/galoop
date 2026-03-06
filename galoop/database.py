@@ -37,7 +37,6 @@ def row_to_individual(row: sqlite3.Row) -> Individual:
     """Convert a DB row to an Individual instance."""
     return Individual(
         id=row["id"],
-        generation=row["generation"],
         parent_ids=_dec_list(row["parent_ids"]),
         operator=row["operator"],
         status=row["status"],
@@ -62,7 +61,6 @@ CREATE TABLE IF NOT EXISTS run_params (
 
 CREATE TABLE IF NOT EXISTS structures (
     id                      TEXT PRIMARY KEY,
-    generation              INTEGER NOT NULL,
     parent_ids              TEXT    NOT NULL DEFAULT '[]',
     operator                TEXT    NOT NULL DEFAULT 'init',
     status                  TEXT    NOT NULL DEFAULT 'pending',
@@ -76,7 +74,6 @@ CREATE TABLE IF NOT EXISTS structures (
 );
 
 CREATE INDEX IF NOT EXISTS idx_status ON structures (status);
-CREATE INDEX IF NOT EXISTS idx_generation ON structures (generation);
 CREATE INDEX IF NOT EXISTS idx_gce ON structures (grand_canonical_energy);
 
 CREATE TRIGGER IF NOT EXISTS trg_updated_at
@@ -207,13 +204,12 @@ class GaloopDB:
         with self._tx() as cur:
             cur.execute(
                 """INSERT INTO structures
-                   (id, generation, parent_ids, operator, status,
+                   (id, parent_ids, operator, status,
                     raw_energy, grand_canonical_energy, weight,
                     geometry_path, extra_data)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     ind.id,
-                    ind.generation,
                     _enc(ind.parent_ids),
                     ind.operator,
                     ind.status,
@@ -310,7 +306,7 @@ class GaloopDB:
 
     def to_dataframe(self) -> pd.DataFrame:
         df = pd.read_sql_query(
-            "SELECT * FROM structures ORDER BY generation, rowid",
+            "SELECT * FROM structures ORDER BY rowid",
             self._conn,
         )
         for col in ("parent_ids", "extra_data"):

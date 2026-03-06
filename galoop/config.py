@@ -109,16 +109,16 @@ class FingerprintConfig(BaseModel):
 
 class GAConfig(BaseModel):
     population_size: int = Field(default=20, ge=2)
-    max_generations: int = Field(default=50, ge=1)
-    min_generations: int = Field(default=5, ge=1)
-    max_stall_generations: int = Field(default=10, ge=1)
+    max_structures: int = Field(default=1000, ge=1)
+    min_structures: int = Field(default=100, ge=1)
+    max_stall: int = Field(default=10, ge=1)
     min_adsorbates: int = Field(default=1, ge=0)
     max_adsorbates: int = Field(default=8, ge=1)
 
     @model_validator(mode="after")
-    def _gen_bounds(self) -> GAConfig:
-        if self.min_generations > self.max_generations:
-            raise ValueError("min_generations must be <= max_generations")
+    def _struct_bounds(self) -> GAConfig:
+        if self.min_structures > self.max_structures:
+            raise ValueError("min_structures must be <= max_structures")
         return self
 
     @model_validator(mode="after")

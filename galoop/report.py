@@ -393,7 +393,6 @@ def _top_structures_table(individuals: list, n: int = 20) -> str:
             f"<tr>"
             f"<td>{rank}</td>"
             f"<td><code>{html.escape(ind.id[:12])}…</code></td>"
-            f"<td>{ind.generation}</td>"
             f"<td class='gce'>{gce}</td>"
             f"<td>{raw}</td>"
             f"<td>{ads_str or '—'}</td>"
@@ -404,7 +403,7 @@ def _top_structures_table(individuals: list, n: int = 20) -> str:
     return (
         "<div style='overflow-x:auto'><table>"
         "<thead><tr>"
-        "<th>#</th><th>ID</th><th>Gen</th><th>G (eV)</th><th>E_raw (eV)</th>"
+        "<th>#</th><th>ID</th><th>G (eV)</th><th>E_raw (eV)</th>"
         "<th>Adsorbates</th><th>Operator</th><th>Path</th>"
         "</tr></thead>"
         "<tbody>" + "\n".join(rows) + "</tbody>"
@@ -444,7 +443,6 @@ def _duplicate_summary(df, threshold: float = 0.90) -> str:
     rows = []
     for orig_id, tanimoto_list in top:
         orig = conv_map.get(orig_id)
-        gen = int(orig["generation"]) if orig is not None else "?"
         gce = (
             f"{orig['grand_canonical_energy']:.4f}"
             if orig is not None and orig["grand_canonical_energy"] == orig["grand_canonical_energy"]
@@ -455,7 +453,6 @@ def _duplicate_summary(df, threshold: float = 0.90) -> str:
         rows.append(
             f"<tr>"
             f"<td><code>{html.escape(orig_id)}</code></td>"
-            f"<td>{gen}</td>"
             f"<td class='gce'>{gce}</td>"
             f"<td>{len(tanimoto_list)}</td>"
             f"<td>{avg_sim}</td>"
@@ -465,7 +462,7 @@ def _duplicate_summary(df, threshold: float = 0.90) -> str:
     table = (
         "<div style='overflow-x:auto'><table>"
         "<thead><tr>"
-        "<th>Original ID</th><th>Gen</th><th>G (eV)</th>"
+        "<th>Original ID</th><th>G (eV)</th>"
         "<th>Duplicates</th><th>Avg Tanimoto</th>"
         "</tr></thead>"
         "<tbody>" + "\n".join(rows) + "</tbody>"
@@ -479,35 +476,6 @@ def _duplicate_summary(df, threshold: float = 0.90) -> str:
         f"&nbsp;·&nbsp; threshold={threshold:.2f}"
         f"</p>"
         + table
-    )
-
-
-def _generation_table(df) -> str:
-    """Per-generation counts of converged / total structures."""
-    if df.empty:
-        return ""
-    by_gen = df.groupby("generation").agg(
-        total=("id", "count"),
-        converged=("status", lambda s: (s == "converged").sum()),
-        best_gce=("grand_canonical_energy", "min"),
-    ).reset_index()
-
-    rows = []
-    for _, row in by_gen.iterrows():
-        gce = f"{row['best_gce']:.4f}" if row['best_gce'] == row['best_gce'] else "—"
-        rows.append(
-            f"<tr>"
-            f"<td>{int(row['generation'])}</td>"
-            f"<td>{int(row['total'])}</td>"
-            f"<td>{int(row['converged'])}</td>"
-            f"<td class='gce'>{gce}</td>"
-            f"</tr>"
-        )
-    return (
-        "<table><thead><tr>"
-        "<th>Generation</th><th>Total</th><th>Converged</th><th>Best G (eV)</th>"
-        "</tr></thead>"
-        "<tbody>" + "\n".join(rows) + "</tbody></table>"
     )
 
 
@@ -658,12 +626,6 @@ def generate(
     (CONTCAR preferred, POSCAR fallback) &nbsp;·&nbsp; viridis = visit count
   </p>
   {heatmap_svg}
-</div>
-
-<!-- ── Generation breakdown ── -->
-<div class="section card">
-  <h2>Per-generation breakdown</h2>
-  {_generation_table(df)}
 </div>
 
 <!-- ── Duplicate clustering ── -->

@@ -1,6 +1,7 @@
 """Shared pytest fixtures."""
 
 import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -57,9 +58,9 @@ def minimal_config(cu_slab_path):
             "population_size": 8,
             "min_adsorbates": 1,
             "max_adsorbates": 4,
-            "min_generations": 1,
-            "max_generations": 10,
-            "max_stall_generations": 5,
+            "min_structures": 10,
+            "max_structures": 100,
+            "max_stall": 5,
         },
     })
 
@@ -92,7 +93,7 @@ def converged_population(tmp_path, minimal_config, slab_info, temp_db):
 
     converged = []
     for i, ind in enumerate(temp_db.get_by_status(STATUS.PENDING)):
-        poscar = (tmp_path / "gen_000" / f"struct_{i:04d}" / "POSCAR")
+        poscar = Path(ind.geometry_path)
         contcar = poscar.parent / "CONTCAR"
         shutil.copy(poscar, contcar)
         updated = ind.with_energy(raw=-500.0 - i, grand_canonical=-1.0 - i * 0.1)

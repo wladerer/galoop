@@ -2,6 +2,7 @@
 galoop/galoop.py
 
 Async steady-state GA loop.  Spawns and harvests structures independently.
+All structures live under a single flat directory: <run_dir>/gcga/structure_NNNNN/
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from galoop.science.reproduce import splice, merge, mutate_add, mutate_remove
 
 log = logging.getLogger(__name__)
 
-POLL_INTERVAL = 15  # seconds between scheduler polls
+POLL_INTERVAL = 15  # seconds between future polls
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -35,8 +36,6 @@ def run(
     config,
     run_dir: Path,
     slab_info,
-    pipeline,
-    scheduler,
     rng: np.random.Generator | None = None,
 ) -> None:
     """
@@ -44,17 +43,16 @@ def run(
 
     Parameters
     ----------
-    config : validated GaloopConfig
-    run_dir : root run directory
+    config    : validated GaloopConfig
+    run_dir   : root run directory
     slab_info : SlabInfo from load_slab()
-    pipeline : Pipeline from build_pipeline()  (currently unused in the loop
-               because jobs run externally — but kept for future in-process mode)
-    scheduler : Scheduler instance
-    rng : NumPy random generator
+    rng       : NumPy random generator
     """
     rng = rng or np.random.default_rng()
     run_dir = Path(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    gcga_dir = run_dir / "gcga"
 
     log.info("Starting async GA loop in %s", run_dir)
 
@@ -64,11 +62,11 @@ def run(
         db.setup()
 
         # Build initial population if this is a fresh run
-        if not (run_dir / "gen_000").exists():
+        if not gcga_dir.exists():
             log.info("Building initial population …")
             _build_initial_population(config, slab_info, db, run_dir, rng)
 
-        active_jobs: dict[str, str] = {}   # struct_key → job_id
+        active_futures: dict[str, object] = {}   # struct_key → parsl AppFuture
         struct_cache: dict[str, StructRecord] = {}
         best_gce = float("inf")
         stall_count = 0
@@ -90,45 +88,52 @@ def run(
                 log.info("Stop file detected — exiting.")
                 break
 
-            # Poll finished jobs
-            if active_jobs:
-                statuses = scheduler.status(list(active_jobs.values()))
+            # Harvest completed futures
+            for struct_key, future in list(active_futures.items()):
+                if not future.done():
+                    continue
 
-                for struct_key, job_id in list(active_jobs.items()):
-                    js = statuses.get(job_id)
-                    if js is None or js.value not in ("done", "failed"):
-                        continue
+                struct_dir = _key_to_dir(struct_key, run_dir)
+                ind = _find_ind_for_dir(struct_dir, db)
+                if ind is None:
+                    log.warning("No DB record for %s", struct_key)
+                    del active_futures[struct_key]
+                    continue
 
-                    struct_dir = _key_to_dir(struct_key, run_dir)
-                    ind = _find_ind_for_dir(struct_dir, db)
-                    if ind is None:
-                        log.warning("No DB record for %s", struct_key)
-                        del active_jobs[struct_key]
-                        continue
+                # Check for execution-level exception
+                try:
+                    future.result()
+                except Exception as exc:
+                    log.warning("  %s: task raised: %s", struct_key, exc)
+                    ind = ind.with_status(STATUS.FAILED)
+                    db.update(ind)
+                    del active_futures[struct_key]
+                    total_evals += 1
+                    continue
 
-                    # Sync status from filesystem sentinel
-                    sentinel = _read_sentinel(struct_dir)
-                    if sentinel and sentinel != ind.status:
-                        ind = ind.with_status(sentinel)
-                        db.update(ind)
+                # Sync status from filesystem sentinel
+                sentinel = _read_sentinel(struct_dir)
+                if sentinel and sentinel != ind.status:
+                    ind = ind.with_status(sentinel)
+                    db.update(ind)
 
-                    if ind.status == STATUS.CONVERGED:
-                        ind, total_evals, best_gce, stall_count = _handle_converged(
-                            ind, struct_dir, db, struct_cache, chem_pots,
-                            config, total_evals, best_gce, stall_count,
-                            n_slab_atoms=slab_info.n_slab_atoms,
-                        )
-                    elif STATUS.is_terminal(ind.status):
-                        total_evals += 1
-                        log.info("  %s: %s", struct_key, ind.status)
+                if ind.status == STATUS.CONVERGED:
+                    ind, total_evals, best_gce, stall_count = _handle_converged(
+                        ind, struct_dir, db, struct_cache, chem_pots,
+                        config, total_evals, best_gce, stall_count,
+                        n_slab_atoms=slab_info.n_slab_atoms,
+                    )
+                elif STATUS.is_terminal(ind.status):
+                    total_evals += 1
+                    log.info("  %s: %s", struct_key, ind.status)
 
-                    del active_jobs[struct_key]
+                del active_futures[struct_key]
 
-            # Top up worker pool: submit PENDING first, spawn only when pool is empty
-            _fill_workers(run_dir, db, scheduler, active_jobs, config, slab_info, rng, total_evals)
+            # Top up worker pool
+            _fill_workers(run_dir, db, active_futures, config, slab_info, rng, total_evals)
 
             # Convergence check
-            if not active_jobs and not db.get_by_status(STATUS.PENDING):
+            if not active_futures and not db.get_by_status(STATUS.PENDING):
                 if _should_stop(total_evals, stall_count, config):
                     log.info("Convergence criteria met.")
                     break
@@ -136,8 +141,8 @@ def run(
             log.info(
                 "Evals=%d  Best=%.4f eV  Stall=%d/%d  Active=%d/%d",
                 total_evals, best_gce, stall_count,
-                config.ga.max_stall_generations,
-                len(active_jobs), scheduler.nworkers,
+                config.ga.max_stall,
+                len(active_futures), config.scheduler.nworkers,
             )
             time.sleep(POLL_INTERVAL)
 
@@ -234,8 +239,8 @@ def _handle_converged(
 def _build_initial_population(config, slab_info, db, run_dir, rng):
     from galoop.science.surface import load_adsorbate, place_adsorbate
 
-    gen_dir = run_dir / "gen_000"
-    gen_dir.mkdir(exist_ok=True)
+    gcga_dir = run_dir / "gcga"
+    gcga_dir.mkdir(exist_ok=True)
 
     ads_atoms = {
         a.symbol: load_adsorbate(
@@ -247,8 +252,7 @@ def _build_initial_population(config, slab_info, db, run_dir, rng):
     }
 
     for i in range(config.ga.population_size):
-        struct_id = f"{i:04d}"
-        struct_dir = gen_dir / f"struct_{struct_id}"
+        struct_dir = gcga_dir / f"structure_{i:05d}"
         struct_dir.mkdir(exist_ok=True)
 
         counts = _random_stoichiometry(
@@ -271,7 +275,7 @@ def _build_initial_population(config, slab_info, db, run_dir, rng):
                         rng=rng,
                     )
         except Exception as exc:
-            log.warning("struct_%s: placement failed (%s) — falling back", struct_id, exc)
+            log.warning("structure_%05d: placement failed (%s) — falling back", i, exc)
             first = next(iter(ads_atoms))
             counts = {first: 1}
             current = slab_info.atoms.copy()
@@ -284,34 +288,40 @@ def _build_initial_population(config, slab_info, db, run_dir, rng):
         write(str(poscar), current, format="vasp")
 
         ind = Individual.from_init(
-            generation=0,
             geometry_path=str(poscar),
             extra_data={"adsorbate_counts": dict(counts)},
         )
         _write_sentinel(struct_dir, STATUS.PENDING)
         db.insert(ind)
-        log.debug("struct_%s: %s", struct_id, dict(counts))
+        log.debug("structure_%05d: %s", i, dict(counts))
 
     log.info("Initial population: %d structures", config.ga.population_size)
 
 
 # ── offspring spawning ────────────────────────────────────────────────────
 
-def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
+def _next_struct_dir(gcga_dir: Path) -> Path:
+    """Create and return the next available structure directory."""
+    gcga_dir.mkdir(parents=True, exist_ok=True)
+    n = len(list(gcga_dir.glob("structure_*")))
+    struct_dir = gcga_dir / f"structure_{n:05d}"
+    struct_dir.mkdir(exist_ok=True)
+    return struct_dir
+
+
+def _spawn_one(run_dir, db, config, slab_info, rng):
+    gcga_dir = run_dir / "gcga"
     selectable = db.selectable_pool()
 
-    bucket_n = max(1, (total_evals + config.ga.population_size) // config.ga.population_size)
-    bucket_dir = run_dir / f"gen_{bucket_n:03d}"
-
     if not selectable:
-        return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+        return _place_random(run_dir, db, config, slab_info, rng)
 
     try:
         op = _sample_operator(rng)
         n_parents = 2 if op in (OPERATOR.SPLICE, OPERATOR.MERGE) else 1
 
         if len(selectable) < n_parents:
-            return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+            return _place_random(run_dir, db, config, slab_info, rng)
 
         # Boltzmann-weighted selection (shift by min for numerical stability)
         energies = np.array([p.grand_canonical_energy or 0.0 for p in selectable])
@@ -324,10 +334,10 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
         parent_atoms = []
         for p in parents:
             if not p.geometry_path:
-                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+                return _place_random(run_dir, db, config, slab_info, rng)
             contcar = Path(p.geometry_path).parent / "CONTCAR"
             if not contcar.exists():
-                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+                return _place_random(run_dir, db, config, slab_info, rng)
             parent_atoms.append(read(str(contcar), format="vasp"))
 
         if op == OPERATOR.SPLICE:
@@ -339,15 +349,14 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
 
             parent_counts = parents[0].extra_data.get("adsorbate_counts", {})
             if sum(parent_counts.values()) >= config.ga.max_adsorbates:
-                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+                return _place_random(run_dir, db, config, slab_info, rng)
 
-            # pick a random adsorbate symbol from config, respecting per-species max
             addable = [
                 a.symbol for a in config.adsorbates
                 if parent_counts.get(a.symbol, 0) < a.max_count
             ]
             if not addable:
-                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+                return _place_random(run_dir, db, config, slab_info, rng)
             sym = str(rng.choice(addable))
             ads_cfg = next(a for a in config.adsorbates if a.symbol == sym)
             ads_mol = load_adsorbate(
@@ -365,12 +374,12 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
         elif op == OPERATOR.MUTATE_REMOVE:
             result = mutate_remove(parent_atoms[0], slab_info.n_slab_atoms, rng=rng)
             if result is None:
-                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+                return _place_random(run_dir, db, config, slab_info, rng)
             child = result
         else:
-            return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+            return _place_random(run_dir, db, config, slab_info, rng)
 
-        # Reject offspring that violate total adsorbate bounds (can happen after splice/merge)
+        # Reject offspring that violate total adsorbate bounds
         if op in (OPERATOR.SPLICE, OPERATOR.MERGE):
             trial_counts = _infer_adsorbate_counts(
                 child.get_chemical_symbols()[slab_info.n_slab_atoms:],
@@ -378,12 +387,9 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
             )
             total = sum(trial_counts.values())
             if total > config.ga.max_adsorbates or total < config.ga.min_adsorbates:
-                return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+                return _place_random(run_dir, db, config, slab_info, rng)
 
-        bucket_dir.mkdir(parents=True, exist_ok=True)
-        struct_n = len(sorted(bucket_dir.glob("struct_????"))) + 1
-        struct_dir = bucket_dir / f"struct_{struct_n:04d}"
-        struct_dir.mkdir(exist_ok=True)
+        struct_dir = _next_struct_dir(gcga_dir)
         poscar = struct_dir / "POSCAR"
         write(str(poscar), child, format="vasp")
 
@@ -392,7 +398,6 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
             config.adsorbates,
         )
         ind = Individual.from_parents(
-            generation=int(bucket_dir.name.split("_")[1]),
             parents=parents,
             operator=op,
             geometry_path=str(poscar),
@@ -405,16 +410,14 @@ def _spawn_one(run_dir, db, config, slab_info, rng, total_evals):
 
     except Exception as exc:
         log.debug("Operator failed: %s — falling back to random", exc)
-        return _place_random(run_dir, bucket_dir, db, config, slab_info, rng)
+        return _place_random(run_dir, db, config, slab_info, rng)
 
 
-def _place_random(run_dir, bucket_dir, db, config, slab_info, rng):
+def _place_random(run_dir, db, config, slab_info, rng):
     from galoop.science.surface import load_adsorbate, place_adsorbate
 
-    bucket_dir.mkdir(parents=True, exist_ok=True)
-    struct_n = len(sorted(bucket_dir.glob("struct_????"))) + 1
-    struct_dir = bucket_dir / f"struct_{struct_n:04d}"
-    struct_dir.mkdir(exist_ok=True)
+    gcga_dir = run_dir / "gcga"
+    struct_dir = _next_struct_dir(gcga_dir)
 
     ads_atoms = {
         a.symbol: load_adsorbate(
@@ -445,7 +448,6 @@ def _place_random(run_dir, bucket_dir, db, config, slab_info, rng):
     write(str(poscar), current, format="vasp")
 
     ind = Individual.from_init(
-        generation=int(bucket_dir.name.split("_")[1]),
         geometry_path=str(poscar),
         extra_data={"adsorbate_counts": dict(counts)},
     )
@@ -457,9 +459,9 @@ def _place_random(run_dir, bucket_dir, db, config, slab_info, rng):
 
 # ── job submission ────────────────────────────────────────────────────────
 
-def _fill_workers(run_dir, db, scheduler, active_jobs, config, slab_info, rng, total_evals):
-    n_active = len(active_jobs)
-    limit = scheduler.nworkers
+def _fill_workers(run_dir, db, active_futures, config, slab_info, rng, total_evals):
+    n_active = len(active_futures)
+    limit = config.scheduler.nworkers
 
     if n_active >= limit:
         return
@@ -476,33 +478,35 @@ def _fill_workers(run_dir, db, scheduler, active_jobs, config, slab_info, rng, t
             db.update(ind)
             continue
         key = _dir_to_key(struct_dir)
-        if key in active_jobs:
+        if key in active_futures:
             continue
-        _submit_one(ind, run_dir, db, scheduler, active_jobs, config)
+        _submit_one(ind, run_dir, db, active_futures, config)
         n_active += 1
 
     # Only spawn new offspring once the PENDING pool is drained
     while n_active < limit:
-        new_ind = _spawn_one(run_dir, db, config, slab_info, rng, total_evals)
+        new_ind = _spawn_one(run_dir, db, config, slab_info, rng)
         if new_ind is None:
             break
-        _submit_one(new_ind, run_dir, db, scheduler, active_jobs, config)
+        _submit_one(new_ind, run_dir, db, active_futures, config)
         n_active += 1
 
 
-def _submit_one(ind, run_dir, db, scheduler, active_jobs, config):
+def _submit_one(ind, run_dir, db, active_futures, config):
+    from galoop.engine.scheduler import relax_structure
+
     if not ind.geometry_path:
         return
     struct_dir = Path(ind.geometry_path).parent
     config_path = (run_dir / "galoop.yaml").resolve()
-    body = (
-        f"cd {struct_dir.resolve()}\n"
-        f"galoop _run-pipeline {struct_dir.resolve()} --config {config_path}\n"
-    )
-    job_name = f"galoop_{struct_dir.parent.name}_{struct_dir.name}"
 
     try:
-        job_id = scheduler.submit(job_name, body, struct_dir)
+        future = relax_structure(
+            str(struct_dir.resolve()),
+            str(config_path),
+            stdout=str(struct_dir / "parsl.out"),
+            stderr=str(struct_dir / "parsl.err"),
+        )
     except Exception as exc:
         log.warning("Submit failed for %s: %s", struct_dir.name, exc)
         return
@@ -510,8 +514,8 @@ def _submit_one(ind, run_dir, db, scheduler, active_jobs, config):
     ind = ind.with_status(STATUS.SUBMITTED)
     db.update(ind)
     _write_sentinel(struct_dir, STATUS.SUBMITTED)
-    active_jobs[_dir_to_key(struct_dir)] = job_id
-    log.info("Submitted %s/%s → %s", struct_dir.parent.name, struct_dir.name, job_id)
+    active_futures[_dir_to_key(struct_dir)] = future
+    log.info("Submitted %s", struct_dir.name)
 
 
 # ── small helpers ─────────────────────────────────────────────────────────
@@ -552,8 +556,8 @@ def _reconcile_submitted_orphans(run_dir, db, struct_cache, chem_pots, config,
                                   total_evals, best_gce, stall_count,
                                   n_slab_atoms: int = 0):
     """
-    On resume, any structure still in 'submitted' state is an orphan — the
-    scheduler no longer knows about it.  Re-read the filesystem sentinel and:
+    On resume, any structure still in 'submitted' state is an orphan — parsl
+    no longer knows about it.  Re-read the filesystem sentinel and:
       - CONVERGED  → run through _handle_converged (compute GCE, dup-check)
       - FAILED / DESORBED / DUPLICATE → update DB status
       - anything else → reset to PENDING so it gets resubmitted
@@ -620,13 +624,11 @@ def _rebuild_struct_cache(run_dir, db, struct_cache, config, n_slab_atoms: int =
 
 
 def _should_stop(total_evals, stall_count, config):
-    min_evals = config.ga.min_generations * config.ga.population_size
-    max_evals = config.ga.max_generations * config.ga.population_size
-    if total_evals < min_evals:
+    if total_evals < config.ga.min_structures:
         return False
-    if total_evals >= max_evals:
+    if total_evals >= config.ga.max_structures:
         return True
-    return stall_count >= config.ga.max_stall_generations
+    return stall_count >= config.ga.max_stall
 
 
 def _stop_requested(run_dir):
@@ -634,6 +636,7 @@ def _stop_requested(run_dir):
 
 
 def _dir_to_key(struct_dir):
+    # e.g. "gcga/structure_00000"
     return f"{struct_dir.parent.name}/{struct_dir.name}"
 
 
@@ -642,7 +645,6 @@ def _key_to_dir(key, run_dir):
 
 
 def _find_ind_for_dir(struct_dir, db):
-    # Include the generation folder to avoid matching same struct name across generations
     return db.find_by_geometry_path_substring(
         f"{struct_dir.parent.name}/{struct_dir.name}"
     )
@@ -681,8 +683,7 @@ def _infer_adsorbate_counts(
     Reconstruct molecular-level {symbol: count} from a flat element list.
 
     Greedy, largest-formula-first, so 'OOH' is matched before 'O'.
-    Leftover atoms that don't complete a molecule are silently discarded
-    (can happen after splice/merge operations).
+    Leftover atoms that don't complete a molecule are silently discarded.
     """
     from galoop.science.surface import parse_formula
 

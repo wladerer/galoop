@@ -137,10 +137,10 @@ class TestStatusTransitions:
 
 class TestRestart:
 
-    def test_gen000_gate_prevents_rebuild(
+    def test_gcga_gate_prevents_rebuild(
         self, tmp_path, minimal_config, slab_info, temp_db
     ):
-        """The galoop.run() gate: population is not rebuilt if gen_000 exists."""
+        """The galoop.run() gate: population is not rebuilt if gcga dir exists."""
         from galoop.galoop import _build_initial_population
 
         rng = np.random.default_rng(42)
@@ -148,7 +148,7 @@ class TestRestart:
         n_before = len(temp_db.get_by_status(STATUS.PENDING))
 
         # Simulate the restart gate from galoop.run()
-        if not (tmp_path / "gen_000").exists():
+        if not (tmp_path / "gcga").exists():
             _build_initial_population(minimal_config, slab_info, temp_db, tmp_path, rng)
 
         assert len(temp_db.get_by_status(STATUS.PENDING)) == n_before
