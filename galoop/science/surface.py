@@ -61,22 +61,16 @@ def load_slab(
     n_slab = len(atoms)
 
     if atoms.constraints:
-        log.info("Loaded slab with %d atoms; using selective dynamics from POSCAR", n_slab)
+        from ase.constraints import FixAtoms
+        n_fixed = sum(
+            len(c.index) for c in atoms.constraints if isinstance(c, FixAtoms)
+        )
+        log.info("Loaded slab with %d atoms; %d fixed via selective dynamics", n_slab, n_fixed)
     else:
-        z_coords = atoms.get_positions()[:, 2]
-        fixed_mask = z_coords < zmin
-        n_fixed = int(np.sum(fixed_mask))
-        if n_fixed > 0:
-            atoms.set_constraint(FixAtoms(indices=np.where(fixed_mask)[0]))
-            log.info(
-                "No selective dynamics in POSCAR; fixed %d atoms (z < %.1f Å)",
-                n_fixed, zmin,
-            )
-        else:
-            log.warning(
-                "No selective dynamics and no atoms below zmin=%.1f — slab atoms will be unconstrained",
-                zmin,
-            )
+        log.warning(
+            "No selective dynamics in slab POSCAR — all slab atoms will be unconstrained. "
+            "Add selective dynamics (T/F flags) to freeze bulk layers."
+        )
 
     return SlabInfo(
         atoms=atoms,
@@ -391,3 +385,56 @@ def detect_desorption(
 
     ads_z = atoms.get_positions()[slab_info.n_slab_atoms:, 2]
     return bool(np.any(ads_z > z_threshold))
+
+
+def validate_surface_binding(
+    atoms: Atoms,
+    n_slab: int,
+    bond_mult: float = 1.3,
+) -> tuple[bool, list[list[int]]]:
+    """Check that every adsorbate molecule is bonded to the surface.
+
+    Groups adsorbate atoms into molecules (via covalent bonding), then
+    verifies each molecule has at least one atom within bonding distance
+    of a slab atom.  Subsurface atoms count as bound.
+
+    Parameters
+    ----------
+    atoms : relaxed structure (slab + adsorbates)
+    n_slab : number of leading slab atoms
+    bond_mult : multiplier on sum of covalent radii for surface bond cutoff
+
+    Returns
+    -------
+    (all_bound, unbound_molecules) where unbound_molecules is a list of
+    atom-index lists for molecules with no surface contact.
+    """
+    from ase.neighborlist import NeighborList, natural_cutoffs
+    from galoop.science.reproduce import _group_molecules
+
+    if len(atoms) <= n_slab:
+        return True, []
+
+    molecules = _group_molecules(atoms, n_slab)
+    if not molecules:
+        return True, []
+
+    # Build neighbor list with bond_mult for detecting surface bonds
+    cutoffs = natural_cutoffs(atoms, mult=bond_mult)
+    nl = NeighborList(cutoffs, self_interaction=False, bothways=True, skin=0.0)
+    nl.update(atoms)
+
+    slab_indices = set(range(n_slab))
+    unbound: list[list[int]] = []
+
+    for mol in molecules:
+        has_surface_contact = False
+        for atom_idx in mol:
+            neighbors, _ = nl.get_neighbors(atom_idx)
+            if slab_indices & set(int(n) for n in neighbors):
+                has_surface_contact = True
+                break
+        if not has_surface_contact:
+            unbound.append(mol)
+
+    return len(unbound) == 0, unbound

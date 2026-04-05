@@ -42,7 +42,6 @@ from galoop.science.reproduce import (
 log = logging.getLogger(__name__)
 
 POLL_INTERVAL = 10  # seconds between loop iterations
-KB_EV = 8.617333e-5  # eV / K
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -105,6 +104,18 @@ def run(
     log.info("Resuming with %d converged structures.  Rebuilding struct cache …",
              total_evals)
     _rebuild_struct_cache(store, struct_cache, config, slab_info.n_slab_atoms)
+
+    # GPR surrogate (optional)
+    gpr = None
+    if config.ga.gpr_guided:
+        from galoop.gpr import CompositionGPR
+        gpr = CompositionGPR(
+            species=[a.symbol for a in config.adsorbates],
+            ads_configs=config.adsorbates,
+            min_total=config.ga.min_adsorbates,
+            max_total=config.ga.max_adsorbates,
+        )
+        _retrain_gpr(gpr, store)
 
     best_gce = float("inf")
     stall_count = 0
@@ -220,6 +231,21 @@ def run(
                     store.update(ind)
                     continue
 
+                # Check surface binding: every adsorbate molecule must
+                # contact the slab (subsurface atoms count as bound)
+                from galoop.science.surface import validate_surface_binding
+                is_bound, unbound_mols = validate_surface_binding(
+                    result["final_atoms"], slab_info.n_slab_atoms,
+                )
+                if not is_bound:
+                    log.info("  %s: %d unbound molecule(s) — marking UNBOUND",
+                             ind_id, len(unbound_mols))
+                    ind = ind.with_status(STATUS.UNBOUND)
+                    ind.extra_data = {**ind.extra_data,
+                                      "n_unbound_molecules": len(unbound_mols)}
+                    store.update(ind)
+                    continue
+
                 ind, total_evals, best_gce = _handle_converged(
                     ind, struct_dir, store, struct_cache, chem_pots,
                     config, total_evals, best_gce,
@@ -232,6 +258,10 @@ def run(
                     stall_count = 0
                 else:
                     stall_count += 1
+
+                # Retrain GPR when new data arrives
+                if gpr is not None and done_ids:
+                    _retrain_gpr(gpr, store)
 
             # Convergence check — stop spawning if stalled, drain active futures
             if _should_stop(total_evals, stall_count, config):
@@ -248,7 +278,7 @@ def run(
                     store, config, slab_info, rng, total_evals,
                     active_futures, relax_structure, stage_configs,
                     mace_model, slab_info.n_slab_atoms,
-                    pair_counts, struct_cache,
+                    pair_counts, struct_cache, gpr,
                 )
 
             log.info(
@@ -305,6 +335,14 @@ def _handle_converged(
     try:
         atoms = read(str(contcar), format="vasp")
         raw_e = _read_energy(struct_dir)
+
+        # Sanity check: reject structures with atom-atom overlap
+        if _has_atom_overlap(atoms, min_dist=0.5):
+            log.warning("  %s: atom overlap detected (d < 0.5 Å) — failed", ind.id)
+            ind = ind.with_status(STATUS.FAILED)
+            ind.extra_data = {**ind.extra_data, "fail_reason": "atom_overlap"}
+            store.update(ind)
+            return ind, total_evals, best_gce
 
         label, dup_id, soap_vec = classify_postrelax(
             atoms,
@@ -415,11 +453,10 @@ def _build_initial_population(config, slab_info, store: GaloopStore, rng):
                 slab_info.zmin, slab_info.zmax, rng=rng,
             )
 
-        # Simulated annealing: settle adsorbates into binding sites
-        if config.ga.anneal_initial:
-            current = _anneal_structure(
-                current, config, slab_info.n_slab_atoms,
-            )
+        # Quick constrained pre-relax: let adsorbates settle toward surface
+        current = _snap_to_surface(
+            current, config, slab_info.n_slab_atoms,
+        )
 
         ind = Individual.from_init(extra_data={"adsorbate_counts": dict(counts)})
         struct_dir = store.insert(ind)
@@ -432,36 +469,28 @@ def _build_initial_population(config, slab_info, store: GaloopStore, rng):
     log.info("Initial population: %d structures", config.ga.population_size)
 
 
-def _anneal_structure(
+def _snap_to_surface(
     atoms: Atoms,
     config,
     n_slab_atoms: int,
 ) -> Atoms:
-    """Simulated annealing via basin-hopping: rattle adsorbates and quench.
+    """Quick constrained pre-relax to settle adsorbates toward the surface.
 
-    Alternates between random perturbation and relaxation with decreasing
-    amplitude, using Metropolis acceptance.  The slab is fully fixed so
-    only adsorbate degrees of freedom are explored.
+    Fixes the slab and runs a short BFGS so adsorbates fall into reasonable
+    binding positions.  Then clamps adsorbate z-coordinates to a safe window
+    (0.8–4.0 Å above slab top) to prevent burial or desorption.
 
-    Parameters
-    ----------
-    atoms : slab + adsorbates
-    config : GaloopConfig
-    n_slab_atoms : number of leading slab atoms
-
-    Returns
-    -------
-    Atoms with adsorbates settled into better binding positions
+    Much cheaper than full simulated annealing (~1s vs ~2.5 min per structure).
     """
     from ase.constraints import FixAtoms
     from ase.optimize import BFGS
     from pathlib import Path as _Path
 
-    T_start = config.ga.anneal_temp_start
-    T_end = config.ga.anneal_temp_end
-    total_steps = config.ga.anneal_steps
+    work = atoms.copy()
 
-    best = atoms.copy()
+    ads_indices = list(range(n_slab_atoms, len(work)))
+    if not ads_indices:
+        return work
 
     # Build MACE calculator
     model = config.mace_model
@@ -481,66 +510,30 @@ def _anneal_structure(
             default_dtype=config.mace_dtype,
         )
 
-    best.calc = calc
+    work.calc = calc
+    work.set_constraint(FixAtoms(indices=list(range(n_slab_atoms))))
 
-    # Fix entire slab for fast adsorbate-only optimization
-    best.set_constraint(FixAtoms(indices=list(range(n_slab_atoms))))
-
-    ads_indices = list(range(n_slab_atoms, len(best)))
-    if not ads_indices:
-        return best
-
-    # Initial relaxation to nearest minimum
+    # Short BFGS: adsorbates relax toward surface binding sites
     try:
-        dyn = BFGS(best, logfile=None)
-        dyn.run(fmax=0.1, steps=50)
-        best_energy = best.get_potential_energy()
+        dyn = BFGS(work, logfile=None)
+        dyn.run(fmax=0.2, steps=30)
     except Exception:
-        return atoms
-
-    # Basin-hopping with cooling schedule
-    temps = np.linspace(T_start, T_end, total_steps)
-
-    for step, T in enumerate(temps):
-        trial = best.copy()
-        trial.calc = calc
-        trial.set_constraint(best.constraints)
-
-        # Perturb adsorbate positions — amplitude scales with temperature
-        amplitude = 0.5 * (T / T_start)
-        pos = trial.get_positions()
-        slab_top_z = pos[:n_slab_atoms, 2].max()
-        z_min = slab_top_z + 0.5   # don't go subsurface
-        z_max = slab_top_z + 4.0   # don't fly into vacuum
-        for idx in ads_indices:
-            pos[idx] += np.random.randn(3) * amplitude
-            pos[idx, 2] = np.clip(pos[idx, 2], z_min, z_max)
-        trial.set_positions(pos)
-
-        try:
-            dyn = BFGS(trial, logfile=None)
-            dyn.run(fmax=0.1, steps=30)
-            trial_energy = trial.get_potential_energy()
-        except Exception:
-            continue
-
-        # Metropolis acceptance
-        dE = trial_energy - best_energy
-        if dE < 0 or np.random.random() < np.exp(-dE / (KB_EV * max(T, 1.0))):
-            best = trial
-            best_energy = trial_energy
-
-    # Final quench to tighter tolerance
-    try:
-        dyn = BFGS(best, logfile=None)
-        dyn.run(fmax=0.05, steps=50)
-    except Exception:
+        # If BFGS fails, still clamp z and return
         pass
 
-    # Restore original constraints and strip calculator
-    result = best.copy()
-    result.set_constraint(atoms.constraints)
+    # Clamp adsorbate z to safe window above slab
+    pos = work.get_positions()
+    slab_top_z = pos[:n_slab_atoms, 2].max()
+    z_min = slab_top_z + 0.8   # don't bury into slab
+    z_max = slab_top_z + 4.0   # don't float into vacuum
+    for idx in ads_indices:
+        pos[idx, 2] = np.clip(pos[idx, 2], z_min, z_max)
+    work.set_positions(pos)
+
+    # Strip calculator and constraints for clean POSCAR
+    result = work.copy()
     result.calc = None
+    result.set_constraint(atoms.constraints)
     return result
 
 
@@ -552,7 +545,8 @@ def _fill_workers(store: GaloopStore, config, slab_info, rng, total_evals,
                   active_futures, relax_fn, stage_configs,
                   mace_model, n_slab_atoms,
                   pair_counts: dict | None = None,
-                  struct_cache: dict | None = None):
+                  struct_cache: dict | None = None,
+                  gpr=None):
     """Spawn offspring until the worker pool is full, submit via Parsl."""
     limit = config.scheduler.nworkers
     max_attempts = limit * 5  # avoid infinite loop
@@ -564,10 +558,25 @@ def _fill_workers(store: GaloopStore, config, slab_info, rng, total_evals,
         if attempts >= max_attempts:
             log.debug("Hit max spawn attempts (%d), moving on", max_attempts)
             break
-        result = _spawn_one(store, config, slab_info, rng, pair_counts)
+
+        # GPR-guided spawning: with gpr_fraction probability, use GPR
+        use_gpr = (
+            gpr is not None
+            and gpr.is_ready
+            and total_evals >= config.ga.gpr_min_samples
+            and rng.random() < config.ga.gpr_fraction
+        )
+
+        if use_gpr:
+            result = _spawn_gpr(
+                gpr, store, config, slab_info, rng,
+            )
+        else:
+            result = _spawn_one(store, config, slab_info, rng, pair_counts)
+
         if result is None:
             attempts += 1
-            continue  # operator failed, retry with new draw
+            continue
         new_ind, child_atoms = result
 
         # Pre-relaxation duplicate check: graph isomorphism on unrelaxed structure
@@ -580,7 +589,8 @@ def _fill_workers(store: GaloopStore, config, slab_info, rng, total_evals,
                 attempts += 1
                 continue
 
-        # Write POSCAR and submit
+        # Write POSCAR and submit — ensure correct slab constraints
+        child_atoms.set_constraint(slab_info.atoms.constraints)
         struct_dir = store.individual_dir(new_ind.id)
         poscar = struct_dir / "POSCAR"
         write(str(poscar), child_atoms, format="vasp")
@@ -769,6 +779,70 @@ def _place_random(store: GaloopStore, config, slab_info, rng):
     return ind, current
 
 
+def _spawn_gpr(gpr, store: GaloopStore, config, slab_info, rng):
+    """Generate a structure with a GPR-suggested composition.
+
+    Returns (Individual, Atoms) or None.
+    """
+    from galoop.science.surface import load_adsorbate, place_adsorbate
+
+    counts = gpr.suggest(rng, kappa=config.ga.gpr_kappa)
+
+    if sum(counts.values()) == 0:
+        return None
+
+    ads_atoms = {
+        a.symbol: load_adsorbate(
+            symbol=a.symbol,
+            geometry=getattr(a, "geometry", None),
+            coordinates=getattr(a, "coordinates", None),
+        )
+        for a in config.adsorbates
+    }
+
+    current = slab_info.atoms.copy()
+    try:
+        for sym, cnt in counts.items():
+            if cnt <= 0:
+                continue
+            ads_cfg = next(a for a in config.adsorbates if a.symbol == sym)
+            for _ in range(cnt):
+                current = place_adsorbate(
+                    current, ads_atoms[sym],
+                    slab_info.zmin, slab_info.zmax,
+                    n_orientations=ads_cfg.n_orientations,
+                    binding_index=ads_cfg.binding_index,
+                    rng=rng,
+                )
+    except Exception as exc:
+        log.debug("GPR spawn placement failed: %s", exc)
+        return None
+
+    ind = Individual.from_init(
+        extra_data={"adsorbate_counts": dict(counts)},
+    )
+    ind.operator = OPERATOR.GPR
+    store.insert(ind)
+    log.debug("Spawned %s via GPR: %s", ind.id, counts)
+    return ind, current
+
+
+def _retrain_gpr(gpr, store: GaloopStore) -> None:
+    """Retrain the GPR on all converged structures."""
+    converged = store.get_by_status(STATUS.CONVERGED)
+    if len(converged) < 2:
+        return
+    compositions = [ind.extra_data.get("adsorbate_counts", {}) for ind in converged]
+    energies = [ind.grand_canonical_energy for ind in converged
+                if ind.grand_canonical_energy is not None]
+    if len(energies) < 2:
+        return
+    try:
+        gpr.fit(compositions[:len(energies)], energies)
+    except Exception as exc:
+        log.debug("GPR training failed: %s", exc)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Struct cache helpers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -924,3 +998,10 @@ def _best_similarity(soap_vec: np.ndarray, struct_cache: dict) -> float:
         return 0.0
     return max(tanimoto_similarity(soap_vec, rec.soap_vector)
                for rec in struct_cache.values())
+
+
+def _has_atom_overlap(atoms: Atoms, min_dist: float = 0.5) -> bool:
+    """True if any two atoms are closer than *min_dist* Å."""
+    dists = atoms.get_all_distances(mic=True)
+    np.fill_diagonal(dists, 999.0)
+    return float(dists.min()) < min_dist

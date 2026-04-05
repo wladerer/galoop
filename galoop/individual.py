@@ -25,8 +25,9 @@ class STATUS:
     FAILED = "failed"
     DUPLICATE = "duplicate"
     DESORBED = "desorbed"
+    UNBOUND = "unbound"
 
-    _TERMINAL = frozenset({"converged", "failed", "duplicate", "desorbed"})
+    _TERMINAL = frozenset({"converged", "failed", "duplicate", "desorbed", "unbound"})
     _ACTIVE = frozenset({"pending", "submitted"})
 
     @staticmethod
@@ -49,6 +50,7 @@ class OPERATOR:
     MUTATE_DISPLACE = "mutate_displace"
     MUTATE_RATTLE_SLAB = "mutate_rattle_slab"
     MUTATE_TRANSLATE = "mutate_translate"
+    GPR = "gpr"
 
 
 # ---------------------------------------------------------------------------

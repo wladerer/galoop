@@ -110,13 +110,13 @@ class FingerprintConfig(BaseModel):
 
 
 class OperatorWeightsConfig(BaseModel):
-    splice: float = Field(default=0.30, ge=0.0)
-    merge: float = Field(default=0.20, ge=0.0)
+    splice: float = Field(default=0.25, ge=0.0)
+    merge: float = Field(default=0.15, ge=0.0)
     mutate_add: float = Field(default=0.15, ge=0.0)
-    mutate_remove: float = Field(default=0.10, ge=0.0)
-    mutate_displace: float = Field(default=0.10, ge=0.0)
+    mutate_remove: float = Field(default=0.12, ge=0.0)
+    mutate_displace: float = Field(default=0.05, ge=0.0)
     mutate_rattle_slab: float = Field(default=0.05, ge=0.0)
-    mutate_translate: float = Field(default=0.10, ge=0.0)
+    mutate_translate: float = Field(default=0.23, ge=0.0)
 
     @model_validator(mode="after")
     def _nonzero_sum(self) -> "OperatorWeightsConfig":
@@ -144,28 +144,28 @@ class GAConfig(BaseModel):
         description="Gaussian sigma for slab surface rattling (Å)",
     )
     displace_amplitude: float = Field(
-        default=1.0, gt=0.0,
+        default=1.5, gt=0.0,
         description="Gaussian sigma for single-atom displacement (Å)",
     )
     translate_amplitude: float = Field(
         default=1.5, gt=0.0,
         description="Gaussian sigma for rigid-body molecule translation (Å)",
     )
-    anneal_initial: bool = Field(
+    gpr_guided: bool = Field(
         default=False,
-        description="Run simulated annealing on initial population before GA",
+        description="Use GPR surrogate to suggest compositions for some spawns",
     )
-    anneal_temp_start: float = Field(
-        default=1000.0, gt=0.0,
-        description="Starting temperature for simulated annealing (K)",
+    gpr_fraction: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Fraction of spawns guided by GPR (rest use GA operators)",
     )
-    anneal_temp_end: float = Field(
-        default=300.0, gt=0.0,
-        description="Final temperature for simulated annealing (K)",
+    gpr_min_samples: int = Field(
+        default=15, ge=2,
+        description="Minimum converged structures before GPR activates",
     )
-    anneal_steps: int = Field(
-        default=200, ge=10,
-        description="Total MD steps for simulated annealing",
+    gpr_kappa: float = Field(
+        default=1.5, ge=0.0,
+        description="UCB exploration parameter (higher = more exploration)",
     )
     operator_weights: OperatorWeightsConfig = Field(
         default_factory=OperatorWeightsConfig,
