@@ -77,7 +77,12 @@ def run(
 
     # Initialise Parsl
     parsl_config = build_parsl_config(config.scheduler, run_dir=run_dir)
-    parsl.load(parsl_config)
+    try:
+        parsl.load(parsl_config)
+    except Exception as exc:
+        log.error("Failed to initialise Parsl: %s", exc)
+        store.close()
+        raise
 
     chem_pots = {a.symbol: a.chemical_potential for a in config.adsorbates}
 
@@ -110,18 +115,50 @@ def run(
     # Active Parsl futures: ind_id -> Future
     active_futures: dict[str, object] = {}
 
-    # Re-submit any structures that were submitted but not completed (crash recovery)
-    for ind in store.get_by_status(STATUS.SUBMITTED):
-        struct_dir = store.individual_dir(ind.id)
-        if (struct_dir / "POSCAR").exists():
-            fut = relax_structure(
-                str(struct_dir), stage_configs,
-                mace_model=mace_model,
-                mace_device=config.mace_device,
-                mace_dtype=config.mace_dtype,
-                n_slab_atoms=slab_info.n_slab_atoms,
-            )
-            active_futures[ind.id] = fut
+    # Crash recovery: handle structures orphaned by a previous crash
+    orphans = store.get_by_status(STATUS.SUBMITTED)
+    if orphans:
+        n_resubmit = 0
+        n_reset = 0
+        for ind in orphans:
+            struct_dir = store.individual_dir(ind.id)
+            contcar = struct_dir / "CONTCAR"
+            poscar = struct_dir / "POSCAR"
+
+            if contcar.exists():
+                # Relaxation completed but wasn't harvested — will be
+                # picked up by _handle_converged on the next poll.
+                # Re-submit to get a result dict (cheap if already done).
+                fut = relax_structure(
+                    str(struct_dir), stage_configs,
+                    mace_model=mace_model,
+                    mace_device=config.mace_device,
+                    mace_dtype=config.mace_dtype,
+                    n_slab_atoms=slab_info.n_slab_atoms,
+                )
+                active_futures[ind.id] = fut
+                n_resubmit += 1
+            elif poscar.exists():
+                # Has POSCAR but relaxation never finished — re-submit
+                fut = relax_structure(
+                    str(struct_dir), stage_configs,
+                    mace_model=mace_model,
+                    mace_device=config.mace_device,
+                    mace_dtype=config.mace_dtype,
+                    n_slab_atoms=slab_info.n_slab_atoms,
+                )
+                active_futures[ind.id] = fut
+                n_resubmit += 1
+            else:
+                # No geometry files at all — reset to pending
+                ind = ind.with_status(STATUS.PENDING)
+                store.update(ind)
+                n_reset += 1
+
+        if n_resubmit:
+            log.info("Crash recovery: re-submitted %d orphaned structures", n_resubmit)
+        if n_reset:
+            log.info("Crash recovery: reset %d structures with no geometry to pending", n_reset)
 
     log.info(
         "Start: evals=%d  best=%.4f eV  active=%d",
@@ -130,11 +167,24 @@ def run(
 
     pair_counts: dict[frozenset, int] = {}
 
+    # Register signal handler for graceful shutdown
+    import signal
+    _shutdown_requested = False
+
+    def _signal_handler(signum, frame):
+        nonlocal _shutdown_requested
+        sig_name = signal.Signals(signum).name
+        log.info("Received %s — shutting down gracefully after current cycle", sig_name)
+        _shutdown_requested = True
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     # ── main loop ──────────────────────────────────────────────────────────
     try:
         while True:
-            if _stop_requested(run_dir):
-                log.info("Stop file detected — exiting.")
+            if _shutdown_requested or _stop_requested(run_dir):
+                log.info("Shutdown requested — exiting.")
                 break
 
             # Harvest completed futures
@@ -209,8 +259,25 @@ def run(
             time.sleep(POLL_INTERVAL)
 
     finally:
-        parsl.clear()
-        store.close()
+        # Mark any still-active futures' structures back to pending
+        # so they get re-submitted on restart
+        for ind_id in list(active_futures.keys()):
+            fut = active_futures[ind_id]
+            if not fut.done():
+                ind = store.get(ind_id)
+                if ind and ind.status == STATUS.SUBMITTED:
+                    ind = ind.with_status(STATUS.PENDING)
+                    store.update(ind)
+
+        try:
+            parsl.clear()
+        except Exception as exc:
+            log.debug("Parsl cleanup: %s", exc)
+
+        try:
+            store.close()
+        except Exception as exc:
+            log.debug("Store cleanup: %s", exc)
 
     log.info("Run complete.  Total evaluations: %d", total_evals)
 

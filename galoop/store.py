@@ -121,9 +121,11 @@ class GaloopStore:
         self._conn = sqlite3.connect(
             str(self._db_path),
             check_same_thread=False,
+            timeout=30.0,  # wait up to 30s if DB is locked
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=30000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -136,7 +138,15 @@ class GaloopStore:
         return d
 
     def close(self) -> None:
-        self._conn.close()
+        """Close the database connection, checkpointing WAL first."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
 
     # -- individual directory -------------------------------------------------
 

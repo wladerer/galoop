@@ -52,6 +52,12 @@ def run(config: str, run_dir: str, seed: int | None, verbose: bool):
     run_dir_path = Path(run_dir)
     run_dir_path.mkdir(parents=True, exist_ok=True)
 
+    # Clean up stale stop file from previous run
+    stop_file = run_dir_path / "galoopstop"
+    if stop_file.exists():
+        log.info("Removing stale stop file from previous run")
+        stop_file.unlink()
+
     try:
         cfg = load_config(config_path)
     except Exception as exc:
