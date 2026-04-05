@@ -54,10 +54,8 @@ class TestAllModulesImport:
         assert STATUS.PENDING == "pending"
         assert OPERATOR.INIT == "init"
 
-    def test_database(self):
-        # database.py is now a shim; GaloopProject is the live implementation
-        from galoop.database import diff_configs
-        from galoop.project import GaloopProject, diff_configs as dc2
+    def test_store(self):
+        from galoop.store import GaloopStore, diff_configs
         assert callable(diff_configs)
 
     def test_fingerprint(self):
@@ -73,8 +71,7 @@ class TestAllModulesImport:
         from galoop.engine.calculator import Pipeline, CalculatorStage, build_pipeline
 
     def test_scheduler(self):
-        # scheduler.py is now a stub; row handles job submission via workflow.toml
-        import galoop.engine.scheduler  # must at least import cleanly
+        from galoop.engine.scheduler import build_parsl_config, relax_structure
 
     def test_surface(self):
         from galoop.science.surface import (

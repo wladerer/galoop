@@ -1,9 +1,8 @@
 """
 tests/test_lifecycle.py
 
-Tests for job status transitions and persistence across project re-opens.
-Sentinels are gone — status lives in job.doc.  Restart = open the same
-signac workspace again.
+Tests for job status transitions and persistence across store re-opens.
+Status lives in the SQLite database.  Restart = open the same DB again.
 """
 
 from __future__ import annotations
@@ -21,22 +20,21 @@ from galoop.individual import OPERATOR, STATUS
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_pop(config, slab_info, project, seed=42):
+def _build_pop(config, slab_info, store, seed=42):
     from galoop.galoop import _build_initial_population
     rng = np.random.default_rng(seed)
-    _build_initial_population(config, slab_info, project, rng)
+    _build_initial_population(config, slab_info, store, rng)
 
 
-def _fake_converge(ind, project, energy: float = -1.0):
-    """Copy POSCAR→CONTCAR, write FINAL_ENERGY, and update project to CONVERGED."""
-    job = project.get_job_by_id(ind.id)
-    struct_dir = Path(job.path)
+def _fake_converge(ind, store, energy: float = -1.0):
+    """Copy POSCAR->CONTCAR, write FINAL_ENERGY, and update store to CONVERGED."""
+    struct_dir = store.individual_dir(ind.id)
     poscar = struct_dir / "POSCAR"
     contcar = struct_dir / "CONTCAR"
     shutil.copy(poscar, contcar)
     (struct_dir / "FINAL_ENERGY").write_text(f"{energy:.10f}\n")
     updated = ind.with_energy(raw=energy * 100, grand_canonical=energy)
-    project.update(updated)
+    store.update(updated)
     return updated
 
 
@@ -105,122 +103,133 @@ class TestStatusTransitions:
         assert counts[STATUS.DESORBED] == 1
         assert counts[STATUS.PENDING] == minimal_config.ga.population_size - 4
 
-    def test_job_doc_status_updated_on_converge(self, minimal_config, slab_info, temp_db):
+    def test_status_updated_on_converge(self, minimal_config, slab_info, temp_db):
         _build_pop(minimal_config, slab_info, temp_db)
         ind = temp_db.get_by_status(STATUS.PENDING)[0]
         _fake_converge(ind, temp_db, energy=-1.5)
-        job = temp_db.get_job_by_id(ind.id)
-        assert job.doc["status"] == STATUS.CONVERGED
+        stored = temp_db.get(ind.id)
+        assert stored.status == STATUS.CONVERGED
 
 
 # ---------------------------------------------------------------------------
-# Restart (re-open the same signac workspace)
+# Restart (re-open the same SQLite database)
 # ---------------------------------------------------------------------------
 
 class TestRestart:
 
-    def test_population_not_rebuilt_if_workspace_exists(
+    def test_population_not_rebuilt_if_db_exists(
         self, tmp_path, minimal_config, slab_info
     ):
-        """The run() gate: population is not rebuilt if workspace already has jobs."""
+        """The run() gate: population is not rebuilt if store already has records."""
         from galoop.galoop import _build_initial_population
-        from galoop.project import GaloopProject
+        from galoop.store import GaloopStore
 
-        project = GaloopProject(tmp_path)
+        store = GaloopStore(tmp_path)
         rng = np.random.default_rng(42)
-        _build_initial_population(minimal_config, slab_info, project, rng)
-        n_before = len(project.get_by_status(STATUS.PENDING))
+        _build_initial_population(minimal_config, slab_info, store, rng)
+        n_before = len(store.get_by_status(STATUS.PENDING))
 
         # Simulate the restart gate from galoop.run()
-        if not any(True for _ in project._project):
-            _build_initial_population(minimal_config, slab_info, project, rng)
+        if store.is_empty():
+            _build_initial_population(minimal_config, slab_info, store, rng)
 
-        assert len(project.get_by_status(STATUS.PENDING)) == n_before
+        assert len(store.get_by_status(STATUS.PENDING)) == n_before
+        store.close()
 
-    def test_jobs_persist_after_reopen(self, tmp_path, minimal_config, slab_info):
-        """All structures survive a project close/reopen cycle."""
+    def test_records_persist_after_reopen(self, tmp_path, minimal_config, slab_info):
+        """All structures survive a store close/reopen cycle."""
         from galoop.galoop import _build_initial_population
-        from galoop.project import GaloopProject
+        from galoop.store import GaloopStore
 
         rng = np.random.default_rng(42)
-        project = GaloopProject(tmp_path)
-        _build_initial_population(minimal_config, slab_info, project, rng)
-        n_written = len(project.get_by_status(STATUS.PENDING))
+        store = GaloopStore(tmp_path)
+        _build_initial_population(minimal_config, slab_info, store, rng)
+        n_written = len(store.get_by_status(STATUS.PENDING))
+        store.close()
 
         # Re-open from same path
-        project2 = GaloopProject(tmp_path)
-        n_read = len(project2.get_by_status(STATUS.PENDING))
+        store2 = GaloopStore(tmp_path)
+        n_read = len(store2.get_by_status(STATUS.PENDING))
         assert n_read == n_written
+        store2.close()
 
     def test_converged_count_survives_restart(self, tmp_path, minimal_config, slab_info):
         """Converged structures are still queryable after reopening."""
         from galoop.galoop import _build_initial_population
-        from galoop.project import GaloopProject
+        from galoop.store import GaloopStore
 
-        project = GaloopProject(tmp_path)
+        store = GaloopStore(tmp_path)
         rng = np.random.default_rng(42)
-        _build_initial_population(minimal_config, slab_info, project, rng)
-        pending = project.get_by_status(STATUS.PENDING)
+        _build_initial_population(minimal_config, slab_info, store, rng)
+        pending = store.get_by_status(STATUS.PENDING)
         for ind in pending[:3]:
-            _fake_converge(ind, project, energy=-1.0)
-        n_converged = len(project.get_by_status(STATUS.CONVERGED))
+            _fake_converge(ind, store, energy=-1.0)
+        n_converged = len(store.get_by_status(STATUS.CONVERGED))
+        store.close()
 
-        project2 = GaloopProject(tmp_path)
-        assert len(project2.get_by_status(STATUS.CONVERGED)) == n_converged
+        store2 = GaloopStore(tmp_path)
+        assert len(store2.get_by_status(STATUS.CONVERGED)) == n_converged
+        store2.close()
 
     def test_pending_structures_preserved_after_restart(
         self, tmp_path, minimal_config, slab_info
     ):
         from galoop.galoop import _build_initial_population
-        from galoop.project import GaloopProject
+        from galoop.store import GaloopStore
 
-        project = GaloopProject(tmp_path)
+        store = GaloopStore(tmp_path)
         rng = np.random.default_rng(42)
-        _build_initial_population(minimal_config, slab_info, project, rng)
-        pending = project.get_by_status(STATUS.PENDING)
+        _build_initial_population(minimal_config, slab_info, store, rng)
+        pending = store.get_by_status(STATUS.PENDING)
         for ind in pending[: len(pending) // 2]:
-            _fake_converge(ind, project)
-        n_still_pending = len(project.get_by_status(STATUS.PENDING))
+            _fake_converge(ind, store)
+        n_still_pending = len(store.get_by_status(STATUS.PENDING))
+        store.close()
 
-        project2 = GaloopProject(tmp_path)
-        assert len(project2.get_by_status(STATUS.PENDING)) == n_still_pending
+        store2 = GaloopStore(tmp_path)
+        assert len(store2.get_by_status(STATUS.PENDING)) == n_still_pending
+        store2.close()
 
     def test_extra_data_survives_restart(self, tmp_path, minimal_config, slab_info):
-        """Adsorbate counts round-trip through a project reopen."""
+        """Adsorbate counts round-trip through a store reopen."""
         from galoop.galoop import _build_initial_population
-        from galoop.project import GaloopProject
+        from galoop.store import GaloopStore
 
-        project = GaloopProject(tmp_path)
+        store = GaloopStore(tmp_path)
         rng = np.random.default_rng(42)
-        _build_initial_population(minimal_config, slab_info, project, rng)
+        _build_initial_population(minimal_config, slab_info, store, rng)
         before = {
             ind.id: ind.extra_data["adsorbate_counts"]
-            for ind in project.get_by_status(STATUS.PENDING)
+            for ind in store.get_by_status(STATUS.PENDING)
         }
+        store.close()
 
-        project2 = GaloopProject(tmp_path)
+        store2 = GaloopStore(tmp_path)
         after = {
             ind.id: ind.extra_data["adsorbate_counts"]
-            for ind in project2.get_by_status(STATUS.PENDING)
+            for ind in store2.get_by_status(STATUS.PENDING)
         }
         assert before == after
+        store2.close()
 
     def test_selectable_pool_rebuilt_correctly_after_restart(
         self, tmp_path, minimal_config, slab_info
     ):
         from galoop.galoop import _build_initial_population
-        from galoop.project import GaloopProject
+        from galoop.store import GaloopStore
 
-        project = GaloopProject(tmp_path)
+        store = GaloopStore(tmp_path)
         rng = np.random.default_rng(42)
-        _build_initial_population(minimal_config, slab_info, project, rng)
+        _build_initial_population(minimal_config, slab_info, store, rng)
 
         converged_ids = set()
-        for ind in project.get_by_status(STATUS.PENDING)[:4]:
-            updated = _fake_converge(ind, project,
+        for ind in store.get_by_status(STATUS.PENDING)[:4]:
+            updated = _fake_converge(ind, store,
                                      energy=-1.0 - len(converged_ids))
             converged_ids.add(updated.id)
+        store.close()
 
-        project2 = GaloopProject(tmp_path)
-        pool_ids = {p.id for p in project2.selectable_pool()}
+        store2 = GaloopStore(tmp_path)
+        pool_ids = {p.id for p in store2.selectable_pool()}
         assert converged_ids == pool_ids
+        store2.close()

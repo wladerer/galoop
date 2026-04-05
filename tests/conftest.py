@@ -9,14 +9,14 @@ import pytest
 
 @pytest.fixture
 def temp_db(tmp_path):
-    """Provide a temporary GaloopProject (replaces old GaloopDB temp_db fixture)."""
-    from galoop.project import GaloopProject
-    return GaloopProject(tmp_path)
+    """Provide a temporary GaloopStore."""
+    from galoop.store import GaloopStore
+    return GaloopStore(tmp_path)
 
 
 @pytest.fixture
 def cu_slab_path(tmp_path):
-    """Write a simple Cu(111) 2×2×3 slab POSCAR to tmp_path."""
+    """Write a simple Cu(111) 2x2x3 slab POSCAR to tmp_path."""
     from ase.build import fcc111
     from ase.io import write
 
@@ -87,9 +87,9 @@ def converged_population(tmp_path, minimal_config, slab_info, temp_db):
 
     converged = []
     for i, ind in enumerate(temp_db.get_by_status(STATUS.PENDING)):
-        job = temp_db.get_job_by_id(ind.id)
-        poscar = Path(job.path) / "POSCAR"
-        contcar = Path(job.path) / "CONTCAR"
+        struct_dir = temp_db.individual_dir(ind.id)
+        poscar = struct_dir / "POSCAR"
+        contcar = struct_dir / "CONTCAR"
         shutil.copy(poscar, contcar)
         updated = ind.with_energy(raw=-500.0 - i, grand_canonical=-1.0 - i * 0.1)
         temp_db.update(updated)

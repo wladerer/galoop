@@ -1,7 +1,7 @@
 """
 tests/test_individual_and_db.py
 
-Individual data model + Database CRUD.
+Individual data model + GaloopStore CRUD.
 """
 
 import pytest
@@ -131,12 +131,16 @@ class TestDatabase:
         assert counts[STATUS.PENDING] == 2
         assert counts[STATUS.CONVERGED] == 1
 
-    def test_find_by_geometry_path_substring(self, temp_db):
-        ind = Individual.from_init(geometry_path="/run/gen_000/struct_0001/POSCAR")
-        temp_db.insert(ind)
-        found = temp_db.find_by_geometry_path_substring("struct_0001")
-        assert found is not None
-        assert found.id == ind.id
+    def test_is_empty(self, temp_db):
+        assert temp_db.is_empty()
+        temp_db.insert(Individual.from_init())
+        assert not temp_db.is_empty()
+
+    def test_all_converged_unique(self, temp_db):
+        for _ in range(3):
+            temp_db.insert(Individual.from_init().with_status(STATUS.CONVERGED))
+        temp_db.insert(Individual.from_init().mark_duplicate())
+        assert len(temp_db.all_converged_unique()) == 3
 
     def test_to_dataframe(self, temp_db):
         for _ in range(5):
@@ -144,3 +148,21 @@ class TestDatabase:
         df = temp_db.to_dataframe()
         assert len(df) == 5
         assert "id" in df.columns
+
+    def test_config_snapshot_roundtrip(self, temp_db):
+        cfg = {"slab": {"energy": -100.0}, "ga": {"population_size": 20}}
+        temp_db.save_config_snapshot(cfg)
+        diffs = temp_db.diff_config(cfg)
+        assert diffs == []
+
+    def test_config_diff_detects_change(self, temp_db):
+        cfg1 = {"slab": {"energy": -100.0}}
+        cfg2 = {"slab": {"energy": -200.0}}
+        temp_db.save_config_snapshot(cfg1)
+        diffs = temp_db.diff_config(cfg2)
+        assert len(diffs) == 1
+        assert diffs[0]["field"] == "slab.energy"
+
+    def test_wal_mode_enabled(self, temp_db):
+        row = temp_db._conn.execute("PRAGMA journal_mode").fetchone()
+        assert row[0] == "wal"

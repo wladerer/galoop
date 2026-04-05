@@ -48,9 +48,15 @@ def compute_soap(
     n_max: int = 8,
     l_max: int = 6,
     species: list[str] | None = None,
+    n_slab_atoms: int = 0,
 ) -> np.ndarray:
     """
-    Compute a global averaged SOAP descriptor for *atoms*.
+    Compute an averaged SOAP descriptor.
+
+    When *n_slab_atoms* > 0, SOAP is computed only at adsorbate atom
+    centres (indices ``n_slab_atoms:``).  The slab atoms are still part
+    of the environment so binding-site information is captured, but the
+    descriptor is no longer dominated by bulk slab contributions.
 
     Parameters
     ----------
@@ -59,6 +65,8 @@ def compute_soap(
     n_max : radial basis functions per species pair
     l_max : maximum angular momentum
     species : element symbols; auto-detected from *atoms* if ``None``
+    n_slab_atoms : number of leading atoms that belong to the bare slab.
+        When > 0, SOAP is averaged over adsorbate positions only.
 
     Returns
     -------
@@ -80,15 +88,26 @@ def compute_soap(
     if not species:
         return np.zeros(100, dtype=float)
 
+    n_ads = len(atoms) - n_slab_atoms
+    if n_slab_atoms > 0 and n_ads <= 0:
+        return np.zeros(100, dtype=float)
+
     soap = SOAP(
         species=species,
         r_cut=r_cut,
         n_max=n_max,
         l_max=l_max,
-        average="inner",
+        average="off" if n_slab_atoms > 0 else "inner",
         periodic=True,
     )
-    return soap.create(atoms).flatten()
+
+    if n_slab_atoms > 0:
+        # Compute SOAP at adsorbate positions only, then average
+        centers = list(range(n_slab_atoms, len(atoms)))
+        per_atom = soap.create(atoms, centers=centers)
+        return per_atom.mean(axis=0).flatten()
+    else:
+        return soap.create(atoms).flatten()
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +403,7 @@ def classify_postrelax(
         * soap_vector — the computed SOAP vector (cache it for future comparisons)
     """
     new_comp = _composition(atoms)
-    new_soap = compute_soap(atoms, r_cut, n_max, l_max, species)
+    new_soap = compute_soap(atoms, r_cut, n_max, l_max, species, n_slab_atoms=n_slab_atoms)
 
     # Build graph fingerprint when slab size is known
     new_chem_envs: list | None = None

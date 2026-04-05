@@ -18,7 +18,8 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 class SlabConfig(BaseModel):
     geometry: str = Field(..., description="Path to POSCAR/CONTCAR")
-    energy: float = Field(..., description="DFT energy of bare slab (eV)")
+    energy: float | None = Field(default=None,
+        description="DFT energy of bare slab (eV). Set to null or omit to auto-compute.")
     sampling_zmin: float = Field(..., description="Min z for adsorbate placement (Å)")
     sampling_zmax: float = Field(..., description="Max z for adsorbate placement (Å)")
 
@@ -31,7 +32,8 @@ class SlabConfig(BaseModel):
 
 class AdsorbateConfig(BaseModel):
     symbol: str = Field(..., description="Chemical symbol or formula")
-    chemical_potential: float = Field(..., description="Standard chemical potential (eV)")
+    chemical_potential: float | None = Field(default=None,
+        description="Standard chemical potential (eV). Set to null or omit to auto-compute via CHE.")
     n_orientations: int = Field(default=1, ge=1)
     min_count: int = Field(default=0, ge=0)
     max_count: int = Field(default=5, ge=0)
@@ -138,8 +140,32 @@ class GAConfig(BaseModel):
         description="kT-like scale for Boltzmann parent selection (eV)",
     )
     rattle_amplitude: float = Field(
-        default=0.1, gt=0.0,
+        default=0.15, gt=0.0,
         description="Gaussian sigma for slab surface rattling (Å)",
+    )
+    displace_amplitude: float = Field(
+        default=1.0, gt=0.0,
+        description="Gaussian sigma for single-atom displacement (Å)",
+    )
+    translate_amplitude: float = Field(
+        default=1.5, gt=0.0,
+        description="Gaussian sigma for rigid-body molecule translation (Å)",
+    )
+    anneal_initial: bool = Field(
+        default=False,
+        description="Run simulated annealing on initial population before GA",
+    )
+    anneal_temp_start: float = Field(
+        default=1000.0, gt=0.0,
+        description="Starting temperature for simulated annealing (K)",
+    )
+    anneal_temp_end: float = Field(
+        default=300.0, gt=0.0,
+        description="Final temperature for simulated annealing (K)",
+    )
+    anneal_steps: int = Field(
+        default=200, ge=10,
+        description="Total MD steps for simulated annealing",
     )
     operator_weights: OperatorWeightsConfig = Field(
         default_factory=OperatorWeightsConfig,

@@ -1,7 +1,7 @@
 """
 tests/test_scheduler.py
 
-Tests for the parsl-based scheduler: config building and app execution.
+Tests for the Parsl-based scheduler: config building and app execution.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ class TestBuildParslConfig:
 
 
 # ---------------------------------------------------------------------------
-# relax_structure bash_app
+# relax_structure python_app
 # ---------------------------------------------------------------------------
 
 class TestRelaxStructureApp:
@@ -73,20 +73,6 @@ class TestRelaxStructureApp:
         from galoop.engine.scheduler import relax_structure
         assert callable(relax_structure)
 
-    def test_command_template(self):
-        """The underlying function should produce the expected shell command."""
-        from galoop.engine.scheduler import relax_structure
-        # Access the unwrapped function to inspect the command template
-        cmd = relax_structure.func("/path/to/struct", "/path/to/config.yaml")
-        assert "galoop _run-pipeline" in cmd
-        assert "/path/to/struct" in cmd
-        assert "/path/to/config.yaml" in cmd
-
-    def test_config_path_in_command(self):
-        from galoop.engine.scheduler import relax_structure
-        cmd = relax_structure.func("/run/gcga/structure_00000", "/run/galoop.yaml")
-        assert "--config /run/galoop.yaml" in cmd
-
 
 # ---------------------------------------------------------------------------
 # Parsl local execution
@@ -94,73 +80,61 @@ class TestRelaxStructureApp:
 
 class TestParslLocalExecution:
 
-    def test_trivial_bash_app_runs(self, tmp_path):
-        """Submit a trivial bash job through a local parsl executor."""
+    def test_trivial_python_app_runs(self, tmp_path):
+        """Submit a trivial python job through a local parsl executor."""
         from galoop.config import SchedulerConfig
         from galoop.engine.scheduler import build_parsl_config
-        from parsl.app.app import bash_app
+        from parsl.app.app import python_app
 
         sched = SchedulerConfig(type="local", nworkers=1)
         cfg = build_parsl_config(sched, run_dir=tmp_path)
         dfk = parsl.load(cfg)
         try:
-            @bash_app
-            def echo_hello(stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
-                return "echo hello_from_parsl"
+            @python_app
+            def add(a, b):
+                return a + b
 
-            future = echo_hello(
-                stdout=str(tmp_path / "out.txt"),
-                stderr=str(tmp_path / "err.txt"),
-            )
-            future.result(timeout=30)
-            assert (tmp_path / "out.txt").read_text().strip() == "hello_from_parsl"
+            future = add(2, 3)
+            assert future.result(timeout=30) == 5
         finally:
             parsl.clear()
 
-    def test_failed_bash_app_raises(self, tmp_path):
-        """A bash app that exits non-zero should raise on .result()."""
+    def test_failed_python_app_raises(self, tmp_path):
+        """A python app that raises should raise on .result()."""
         from galoop.config import SchedulerConfig
         from galoop.engine.scheduler import build_parsl_config
-        from parsl.app.app import bash_app
+        from parsl.app.app import python_app
 
         sched = SchedulerConfig(type="local", nworkers=1)
         cfg = build_parsl_config(sched, run_dir=tmp_path)
         dfk = parsl.load(cfg)
         try:
-            @bash_app
-            def fail_app(stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
-                return "exit 1"
+            @python_app
+            def fail_app():
+                raise ValueError("intentional failure")
 
-            future = fail_app(
-                stdout=str(tmp_path / "out.txt"),
-                stderr=str(tmp_path / "err.txt"),
-            )
+            future = fail_app()
             with pytest.raises(Exception):
                 future.result(timeout=30)
         finally:
             parsl.clear()
 
     def test_multiple_futures_complete(self, tmp_path):
-        """Multiple bash apps submitted to a local executor all complete."""
+        """Multiple python apps submitted to a local executor all complete."""
         from galoop.config import SchedulerConfig
         from galoop.engine.scheduler import build_parsl_config
-        from parsl.app.app import bash_app
+        from parsl.app.app import python_app
 
         sched = SchedulerConfig(type="local", nworkers=2)
         cfg = build_parsl_config(sched, run_dir=tmp_path)
         dfk = parsl.load(cfg)
         try:
-            @bash_app
-            def write_n(n: int, stdout=parsl.AUTO_LOGNAME, stderr=parsl.AUTO_LOGNAME):
-                return f"echo {n}"
+            @python_app
+            def square(n):
+                return n * n
 
-            futures = [
-                write_n(i,
-                        stdout=str(tmp_path / f"out_{i}.txt"),
-                        stderr=str(tmp_path / f"err_{i}.txt"))
-                for i in range(4)
-            ]
-            for f in futures:
-                f.result(timeout=30)
+            futures = [square(i) for i in range(4)]
+            results = [f.result(timeout=30) for f in futures]
+            assert results == [0, 1, 4, 9]
         finally:
             parsl.clear()

@@ -61,7 +61,7 @@ def _collect_adsorbate_xy(df, n_slab_atoms: int) -> list[tuple[float, float]]:
     xys: list[tuple[float, float]] = []
     for _, row in df.iterrows():
         gpath = row.get("geometry_path")
-        if not gpath:
+        if not isinstance(gpath, str):
             continue
         gpath = Path(gpath)
         target = gpath.parent / "CONTCAR"
@@ -696,7 +696,7 @@ def _conditions_table(cfg) -> str:
         f"<tr><td>Pressure</td><td class='gce'>{cond.pressure:.4g} bar</td></tr>",
         f"<tr><td>Potential</td><td class='gce'>{cond.potential:.4f} V</td></tr>",
         f"<tr><td>pH</td><td class='gce'>{cond.pH:.2f}</td></tr>",
-        f"<tr><td>Slab energy</td><td class='gce'>{cfg.slab.energy:.6f} eV</td></tr>",
+        f"<tr><td>Slab energy</td><td class='gce'>{cfg.slab.energy:.6f} eV</td></tr>" if cfg.slab.energy is not None else "<tr><td>Slab energy</td><td class='gce'>auto-calibrated</td></tr>",
     ]
     return (
         "<table><thead><tr><th>Parameter</th><th>Value</th></tr></thead>"
@@ -822,11 +822,11 @@ def generate(
     cfg         : loaded GaloopConfig
     output_path : where to write the .html file
     top_n       : number of top structures to list in the table
-    project     : GaloopProject (signac-based)
+    project     : GaloopStore or compatible object with count_by_status(), best(), etc.
     db_path     : deprecated, ignored
     """
     if project is None:
-        raise ValueError("Pass a GaloopProject via the project= argument")
+        raise ValueError("Pass a GaloopStore via the project= argument")
 
     counts      = project.count_by_status()
     best        = project.best(n=top_n)

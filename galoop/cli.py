@@ -5,15 +5,12 @@ Command-line interface.
 
 Usage
 -----
-galoop run --config galoop.yaml   # Start / resume the GA controller loop
-row run                            # (separate terminal) Submit pending jobs
-
-The `run` command manages spawning and evaluation; `row run` handles cluster
-submission of the relax operation.  Both read/write the same signac workspace.
+galoop run --config galoop.yaml   # Start / resume the GA loop
+galoop status -d .                # Print structure counts
+galoop report -d .                # Generate HTML report
 """
 
 import logging
-import shutil
 import sys
 from pathlib import Path
 
@@ -21,7 +18,7 @@ import click
 import numpy as np
 
 from galoop.config import load_config
-from galoop.project import GaloopProject
+from galoop.store import GaloopStore
 
 
 @click.group()
@@ -40,11 +37,7 @@ def cli():
 @click.option("--seed", type=int, default=None)
 @click.option("--verbose", "-v", is_flag=True)
 def run(config: str, run_dir: str, seed: int | None, verbose: bool):
-    """Start or resume the GA controller loop.
-
-    Tip: run `row run` in the same directory to have row submit pending
-    relax jobs to your cluster as this loop spawns them.
-    """
+    """Start or resume the GA loop."""
     from galoop.galoop import run as run_ga
     from galoop.science.surface import load_slab
 
@@ -59,25 +52,6 @@ def run(config: str, run_dir: str, seed: int | None, verbose: bool):
     run_dir_path = Path(run_dir)
     run_dir_path.mkdir(parents=True, exist_ok=True)
 
-    # Ensure workflow.toml is present in the run directory so `row run` works
-    run_toml = run_dir_path / "workflow.toml"
-    if not run_toml.exists():
-        # Look for it next to the package or next to this config file
-        candidates = [
-            Path(__file__).parent.parent / "workflow.toml",  # repo root
-            config_path.parent / "workflow.toml",
-        ]
-        for src in candidates:
-            if src.exists():
-                shutil.copy(src, run_toml)
-                log.info("Copied workflow.toml to %s", run_dir_path)
-                break
-        else:
-            log.warning(
-                "workflow.toml not found — copy it to %s before running `row run`",
-                run_dir_path,
-            )
-
     try:
         cfg = load_config(config_path)
     except Exception as exc:
@@ -85,22 +59,32 @@ def run(config: str, run_dir: str, seed: int | None, verbose: bool):
         sys.exit(1)
 
     try:
+        # Auto-calibrate missing energies before loading slab
+        needs_cal = (
+            cfg.slab.energy is None
+            or any(a.chemical_potential is None for a in cfg.adsorbates)
+        )
+        if needs_cal:
+            from galoop.calibrate import calibrate
+            calibrate(cfg, run_dir=run_dir_path)
+
         slab_info = load_slab(
             cfg.slab.geometry,
             zmin=cfg.slab.sampling_zmin,
             zmax=cfg.slab.sampling_zmax,
         )
 
-        project = GaloopProject(run_dir_path)
+        store = GaloopStore(run_dir_path)
         current_cfg = cfg.model_dump()
-        diffs = project.diff_config(current_cfg)
+        diffs = store.diff_config(current_cfg)
         if diffs:
             log.warning("Config has changed since the last run:")
             for d in diffs:
                 tag = "  [ENERGY CRITICAL]" if d["energy_critical"] else ""
                 log.warning("  %-55s  %s  →  %s%s",
                             d["field"], d["old"], d["new"], tag)
-        project.save_config_snapshot(current_cfg)
+        store.save_config_snapshot(current_cfg)
+        store.close()
 
         rng = np.random.default_rng(seed)
         run_ga(cfg, run_dir_path, slab_info, rng)
@@ -119,14 +103,14 @@ def run(config: str, run_dir: str, seed: int | None, verbose: bool):
 def status(run_dir: str):
     """Print run status."""
     run_dir_path = Path(run_dir)
-    workspace = run_dir_path / "workspace"
+    db_path = run_dir_path / "galoop.db"
 
-    if not workspace.exists():
-        click.echo(f"No workspace at {workspace}", err=True)
+    if not db_path.exists():
+        click.echo(f"No database at {db_path}", err=True)
         sys.exit(1)
 
-    project = GaloopProject(run_dir_path)
-    counts = project.count_by_status()
+    store = GaloopStore(run_dir_path)
+    counts = store.count_by_status()
     total = sum(counts.values())
     n_converged = counts.get("converged", 0)
     n_dup = counts.get("duplicate", 0)
@@ -138,7 +122,7 @@ def status(run_dir: str):
     click.echo(f"\n  total evaluated:     {total}")
     click.echo(f"  duplicate rate:      {dup_rate}")
 
-    best = project.best(n=5)
+    best = store.best(n=5)
     if best:
         click.echo("\nTop 5 by grand canonical energy:")
         for i, ind in enumerate(best, 1):
@@ -146,6 +130,8 @@ def status(run_dir: str):
                  if ind.grand_canonical_energy is not None else "N/A")
             ads = ind.extra_data.get("adsorbate_counts", {})
             click.echo(f"  {i}. G={g} eV  {ind.id}  op={ind.operator}  ads={ads}")
+
+    store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +149,10 @@ def report(run_dir: str, config: str | None, output: str | None, top: int):
     from galoop.report import generate
 
     run_dir_path = Path(run_dir).resolve()
-    workspace = run_dir_path / "workspace"
+    db_path = run_dir_path / "galoop.db"
 
-    if not workspace.exists():
-        click.echo(f"No workspace at {workspace}", err=True)
+    if not db_path.exists():
+        click.echo(f"No database at {db_path}", err=True)
         sys.exit(1)
 
     cfg_path = Path(config).resolve() if config else run_dir_path / "galoop.yaml"
@@ -181,8 +167,26 @@ def report(run_dir: str, config: str | None, output: str | None, top: int):
         sys.exit(1)
 
     out = Path(output) if output else run_dir_path / "report.html"
-    project = GaloopProject(run_dir_path)
-    generate(project=project, cfg=cfg, output_path=out, top_n=top)
+    store = GaloopStore(run_dir_path)
+
+    # Backfill auto-calibrated values from stored config snapshot
+    import json
+    row = store._conn.execute(
+        "SELECT value FROM run_params WHERE key = ?", ("config",)
+    ).fetchone()
+    if row is not None:
+        stored = json.loads(row["value"])
+        if cfg.slab.energy is None and "slab" in stored:
+            cfg.slab.energy = stored["slab"].get("energy")
+        for ads in cfg.adsorbates:
+            if ads.chemical_potential is None:
+                for stored_ads in stored.get("adsorbates", []):
+                    if stored_ads.get("symbol") == ads.symbol:
+                        ads.chemical_potential = stored_ads.get("chemical_potential")
+                        break
+
+    generate(project=store, cfg=cfg, output_path=out, top_n=top)
+    store.close()
     click.echo(f"Report written to {out}")
 
 
@@ -212,10 +216,10 @@ def graph(run_dir: str, config: str, converged: bool, output: str | None, radius
 
     run_dir_path = Path(run_dir).resolve()
     cfg_path = Path(config).resolve()
-    workspace = run_dir_path / "workspace"
+    db_path = run_dir_path / "galoop.db"
 
-    if not workspace.exists():
-        click.echo(f"No workspace at {workspace}", err=True)
+    if not db_path.exists():
+        click.echo(f"No database at {db_path}", err=True)
         sys.exit(1)
 
     try:
@@ -231,19 +235,17 @@ def graph(run_dir: str, config: str, converged: bool, output: str | None, radius
         click.echo(f"Could not load slab: {exc}", err=True)
         sys.exit(1)
 
-    project = GaloopProject(run_dir_path)
-    all_converged = project.get_by_status(STATUS.CONVERGED)
-    all_dups = project.get_by_status(STATUS.DUPLICATE)
+    store = GaloopStore(run_dir_path)
+    all_converged = store.get_by_status(STATUS.CONVERGED)
+    all_dups = store.get_by_status(STATUS.DUPLICATE)
 
     out_path = Path(output) if output else run_dir_path / "graphs.html"
     pages: list[dict] = []
 
     def _load_atoms(ind):
-        job = project.get_job_by_id(ind.id)
-        if job is None:
-            return None
+        struct_dir = store.individual_dir(ind.id)
         for name in ("CONTCAR", "POSCAR"):
-            candidate = Path(job.path) / name
+            candidate = struct_dir / name
             if candidate.exists():
                 try:
                     return ase_read(str(candidate), format="vasp")
@@ -305,6 +307,8 @@ def graph(run_dir: str, config: str, converged: bool, output: str | None, radius
                 if page:
                     pages.append(page)
 
+    store.close()
+
     if not pages:
         click.echo("No graphs to display.", err=True)
         sys.exit(1)
@@ -325,94 +329,6 @@ def stop(run_dir: str):
     stop_file = Path(run_dir) / "galoopstop"
     stop_file.touch()
     click.echo(f"Stop requested: {stop_file}")
-
-
-# ---------------------------------------------------------------------------
-# _relax  (called by row for each pending job)
-# ---------------------------------------------------------------------------
-
-@cli.command("_relax", hidden=True)
-@click.argument("job_id")
-@click.option("--run-dir", "-d", required=True, type=click.Path(exists=True))
-def relax(job_id: str, run_dir: str) -> None:
-    """Run the calculator pipeline for a single structure (called by row)."""
-    import math
-    from ase.io import read
-    from galoop.engine.calculator import build_pipeline
-    from galoop.project import STATUS_RELAXED
-    from galoop.individual import STATUS
-    from galoop.science.surface import detect_desorption, load_slab
-
-    logging.basicConfig(
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        datefmt="%H:%M:%S",
-        level=logging.INFO,
-    )
-    log = logging.getLogger(__name__)
-
-    run_dir_path = Path(run_dir).resolve()
-    config_path = run_dir_path / "galoop.yaml"
-
-    project = GaloopProject(run_dir_path)
-    job = project.get_job_by_id(job_id)
-
-    if job is None:
-        log.error("No job found for id %s", job_id)
-        sys.exit(1)
-
-    # Mark as submitted while pipeline runs
-    job.doc["status"] = STATUS.SUBMITTED
-
-    struct_dir = Path(job.path)
-
-    try:
-        cfg = load_config(config_path)
-    except Exception as exc:
-        log.error("Config load failed: %s", exc)
-        job.doc["status"] = STATUS.FAILED
-        sys.exit(1)
-
-    poscar = struct_dir / "POSCAR"
-    if not poscar.exists():
-        log.error("POSCAR not found: %s", poscar)
-        job.doc["status"] = STATUS.FAILED
-        sys.exit(1)
-
-    try:
-        atoms = read(str(poscar), format="vasp")
-        slab_geometry = config_path.parent / cfg.slab.geometry
-        slab_info = load_slab(slab_geometry,
-                              cfg.slab.sampling_zmin,
-                              cfg.slab.sampling_zmax)
-        pipeline = build_pipeline(cfg.calculator_stages)
-    except Exception as exc:
-        log.exception("Setup failed: %s", exc)
-        job.doc["status"] = STATUS.FAILED
-        sys.exit(1)
-
-    mace_model = cfg.mace_model
-    _candidate = config_path.parent / mace_model
-    if _candidate.exists():
-        mace_model = str(_candidate)
-
-    result = pipeline.run(
-        atoms, struct_dir,
-        mace_model=mace_model,
-        mace_device=cfg.mace_device,
-        mace_dtype=cfg.mace_dtype,
-        n_slab_atoms=slab_info.n_slab_atoms,
-    )
-
-    if not result["converged"] or math.isnan(float(result["final_energy"])):
-        job.doc["status"] = STATUS.FAILED
-        sys.exit(0)
-
-    if detect_desorption(result["final_atoms"], slab_info):
-        job.doc["status"] = STATUS.DESORBED
-        sys.exit(0)
-
-    job.doc["status"] = STATUS_RELAXED
-    sys.exit(0)
 
 
 if __name__ == "__main__":
