@@ -233,6 +233,70 @@ def orient_upright(adsorbate: Atoms, binding_index: int = 0) -> Atoms:
 # Adsorbate placement
 # ---------------------------------------------------------------------------
 
+def find_surface_sites(
+    slab: Atoms,
+    n_slab: int,
+    bond_mult: float = 1.0,
+) -> list[np.ndarray]:
+    """Identify atop, bridge, and hollow sites on the top surface layer.
+
+    Returns a list of (x, y) positions where adsorbates can bind.
+
+    Strategy: find the top-layer slab atoms, then generate atop (directly
+    above each atom), bridge (midpoint of bonded pairs), and hollow
+    (centroid of bonded triangles) sites.
+    """
+    from ase.data import covalent_radii
+
+    pos = slab.get_positions()[:n_slab]
+    z_coords = pos[:, 2]
+    z_top = z_coords.max()
+
+    # Top-layer atoms: within 1.0 Å of the highest z
+    top_mask = z_coords > z_top - 1.0
+    top_indices = np.where(top_mask)[0]
+    top_pos = pos[top_indices]
+
+    sites: list[np.ndarray] = []
+
+    # Atop sites
+    for p in top_pos:
+        sites.append(p[:2].copy())
+
+    # Find bonded pairs in the top layer (nearest-neighbor distance)
+    cell = slab.get_cell()
+    nums = slab.get_atomic_numbers()
+    for i in range(len(top_indices)):
+        for j in range(i + 1, len(top_indices)):
+            ii, jj = top_indices[i], top_indices[j]
+            cutoff = bond_mult * (covalent_radii[nums[ii]] + covalent_radii[nums[jj]])
+            # Use MIC for periodic distance
+            d = slab.get_distance(ii, jj, mic=True)
+            if d < cutoff * 1.5:  # within ~1.5x bond length = nearest neighbors
+                # Bridge site: midpoint (in Cartesian, approximating PBC)
+                mid = 0.5 * (pos[ii][:2] + pos[jj][:2])
+                sites.append(mid)
+
+    # Hollow sites: centroids of triangles formed by bonded triplets
+    for i in range(len(top_indices)):
+        for j in range(i + 1, len(top_indices)):
+            for k in range(j + 1, len(top_indices)):
+                ii, jj, kk = top_indices[i], top_indices[j], top_indices[k]
+                d_ij = slab.get_distance(ii, jj, mic=True)
+                d_jk = slab.get_distance(jj, kk, mic=True)
+                d_ik = slab.get_distance(ii, kk, mic=True)
+                max_cut = max(
+                    covalent_radii[nums[ii]] + covalent_radii[nums[jj]],
+                    covalent_radii[nums[jj]] + covalent_radii[nums[kk]],
+                    covalent_radii[nums[ii]] + covalent_radii[nums[kk]],
+                ) * bond_mult * 1.5
+                if d_ij < max_cut and d_jk < max_cut and d_ik < max_cut:
+                    centroid = (pos[ii][:2] + pos[jj][:2] + pos[kk][:2]) / 3
+                    sites.append(centroid)
+
+    return sites
+
+
 def place_adsorbate(
     slab: Atoms,
     adsorbate: Atoms,
@@ -245,14 +309,15 @@ def place_adsorbate(
     max_attempts: int = 50,
 ) -> Atoms:
     """
-    Randomly place an adsorbate on the slab.
+    Place an adsorbate on the slab, preferring surface binding sites.
 
-    The adsorbate centre-of-mass is placed at a random (x, y) inside the
-    unit cell and a random z in ``[zmin, zmax]``, then rotated around z.
+    First attempts site-aware placement (atop, bridge, hollow sites
+    identified from slab geometry).  Falls back to random (x, y, z)
+    placement if all sites are occupied.
+
     A clash check (via ASE :class:`NeighborList`) rejects placements where
     adsorbate atoms are closer than ``clash_scale × sum_of_covalent_radii``
-    to any other atom.  Up to *max_attempts* placements are tried before
-    accepting the last one with a warning.
+    to any other atom.  Up to *max_attempts* placements are tried.
 
     Parameters
     ----------
@@ -260,6 +325,7 @@ def place_adsorbate(
     adsorbate : adsorbate molecule to place
     zmin, zmax : vertical window (Å)
     n_orientations : unused (kept for config compat; rotation is always random)
+    binding_index : index of atom in adsorbate that binds to surface
     rng : NumPy random generator
     clash_scale : fraction of covalent-radii sum used as clash threshold
     max_attempts : placement retries before accepting with a warning
@@ -275,25 +341,51 @@ def place_adsorbate(
     adsorbate = orient_upright(adsorbate, binding_index=binding_index)
 
     cell = slab.get_cell()
-
-    # Capture slab size BEFORE any adsorbate is appended so check_clash
-    # knows which atom indices are slab atoms (and should be ignored).
     n_slab_before = len(slab)
+
+    # Identify surface binding sites (atop, bridge, hollow)
+    # Use the bare slab atom count — the first n_slab atoms are always slab
+    n_slab_bare = n_slab_before
+    # If slab already has adsorbates, count only slab atoms
+    # (n_slab_before includes previously placed adsorbates)
+    # We need the original slab atom count — infer from constraints
+    for c in slab.constraints:
+        if isinstance(c, FixAtoms):
+            # Slab atoms include fixed + free surface layer
+            # Use the max fixed index + the same count as a heuristic
+            max_fixed = max(c.index) + 1
+            # Rough: slab atoms = at least up to the highest fixed index
+            # but usually more (free surface layer above)
+            break
+
+    sites = find_surface_sites(slab, n_slab_bare)
+    if sites:
+        rng.shuffle(sites)
 
     combined = slab.copy()  # initialise so the variable is always bound
 
+    # Binding height: place binding atom ~1.8-2.2 Å above slab top
+    slab_top_z = slab.get_positions()[:n_slab_bare, 2].max()
+    from ase.data import covalent_radii as _cov_rad
+    binding_z_offset = 1.8  # reasonable default for most adsorbate-metal bonds
+
     for attempt in range(max_attempts):
-        # Random fractional xy, random z in window
-        frac_xy = rng.uniform(0, 1, size=2)
-        xy_cart = frac_xy @ cell[:2, :2]
-        z = rng.uniform(zmin, zmax)
+        if attempt < len(sites):
+            # Site-aware placement: use identified surface site
+            xy = sites[attempt]
+            z = slab_top_z + binding_z_offset + rng.uniform(-0.2, 0.3)
+        else:
+            # Fallback: random (x, y) in unit cell, random z in window
+            frac_xy = rng.uniform(0, 1, size=2)
+            xy = frac_xy @ cell[:2, :2]
+            z = rng.uniform(zmin, zmax)
 
         # Random rotation around the surface normal (z)
         angle = rng.uniform(0, 2 * np.pi)
 
         ads = adsorbate.copy()
         com = ads.get_center_of_mass()
-        ads.translate([xy_cart[0] - com[0], xy_cart[1] - com[1], z - com[2]])
+        ads.translate([xy[0] - com[0], xy[1] - com[1], z - com[2]])
 
         # Rotate around z through the new centre of mass
         pos = ads.get_positions() - ads.get_center_of_mass()

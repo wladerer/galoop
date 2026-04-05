@@ -19,6 +19,7 @@ env/
 
 # Claude Code
 .claude/
+CLAUDE.md
 
 # Project-specific
 gocia.db

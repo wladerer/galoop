@@ -317,6 +317,20 @@ class Pipeline:
                 all_converged = False
                 break
 
+            # Inter-stage connectivity check: verify adsorbates are surface-bound.
+            # Use generous cutoff (1.5×) since geometry may not be fully relaxed.
+            # The stricter post-relax check in the harvest loop catches the rest.
+            if (n_slab_atoms > 0
+                    and n_slab_atoms < len(current_atoms)
+                    and len(self.stages) > 1):
+                if not _check_surface_binding(current_atoms, n_slab_atoms, bond_mult=1.5):
+                    log.warning(
+                        "%s produced unbound adsorbate molecule(s) — aborting pipeline",
+                        stage.name,
+                    )
+                    all_converged = False
+                    break
+
         # Write final outputs
         final_contcar = struct_dir / "CONTCAR"
         try:
@@ -343,6 +357,71 @@ class Pipeline:
 # ---------------------------------------------------------------------------
 # Builder
 # ---------------------------------------------------------------------------
+
+def _check_surface_binding(
+    atoms: Atoms,
+    n_slab: int,
+    bond_mult: float = 1.3,
+) -> bool:
+    """True if every adsorbate molecule has at least one atom bonded to the slab.
+
+    Uses only ASE primitives to keep engine/ isolated from galoop package.
+    """
+    from ase.data import covalent_radii
+    from ase.neighborlist import NeighborList, natural_cutoffs
+
+    ads_indices = list(range(n_slab, len(atoms)))
+    if not ads_indices:
+        return True
+
+    # Group adsorbate atoms into molecules by covalent bonding
+    pos = atoms.get_positions()
+    nums = atoms.get_atomic_numbers()
+    n = len(ads_indices)
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            cutoff = 1.25 * (covalent_radii[nums[ads_indices[i]]]
+                             + covalent_radii[nums[ads_indices[j]]])
+            d = np.linalg.norm(pos[ads_indices[i]] - pos[ads_indices[j]])
+            if d < cutoff:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    visited = [False] * n
+    molecules: list[list[int]] = []
+    for start in range(n):
+        if visited[start]:
+            continue
+        component: list[int] = []
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if visited[node]:
+                continue
+            visited[node] = True
+            component.append(ads_indices[node])
+            stack.extend(adj[node])
+        molecules.append(component)
+
+    # Check each molecule has at least one atom bonded to slab
+    cutoffs = natural_cutoffs(atoms, mult=bond_mult)
+    nl = NeighborList(cutoffs, self_interaction=False, bothways=True, skin=0.0)
+    nl.update(atoms)
+
+    slab_set = set(range(n_slab))
+    for mol in molecules:
+        has_contact = False
+        for atom_idx in mol:
+            neighbors, _ = nl.get_neighbors(atom_idx)
+            if slab_set & set(int(n) for n in neighbors):
+                has_contact = True
+                break
+        if not has_contact:
+            return False
+
+    return True
+
 
 def build_pipeline(stage_configs: list) -> Pipeline:
     """
