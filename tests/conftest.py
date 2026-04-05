@@ -9,15 +9,9 @@ import pytest
 
 @pytest.fixture
 def temp_db(tmp_path):
-    """Provide a temporary, initialised GaloopDB."""
-    from galoop.database import GaloopDB
-
-    db_path = tmp_path / "test.db"
-    db = GaloopDB(db_path)
-    db.connect()
-    db.setup()
-    yield db
-    db.close()
+    """Provide a temporary GaloopProject (replaces old GaloopDB temp_db fixture)."""
+    from galoop.project import GaloopProject
+    return GaloopProject(tmp_path)
 
 
 @pytest.fixture
@@ -89,12 +83,13 @@ def converged_population(tmp_path, minimal_config, slab_info, temp_db):
     from galoop.individual import STATUS
 
     rng = np.random.default_rng(0)
-    _build_initial_population(minimal_config, slab_info, temp_db, tmp_path, rng)
+    _build_initial_population(minimal_config, slab_info, temp_db, rng)
 
     converged = []
     for i, ind in enumerate(temp_db.get_by_status(STATUS.PENDING)):
-        poscar = Path(ind.geometry_path)
-        contcar = poscar.parent / "CONTCAR"
+        job = temp_db.get_job_by_id(ind.id)
+        poscar = Path(job.path) / "POSCAR"
+        contcar = Path(job.path) / "CONTCAR"
         shutil.copy(poscar, contcar)
         updated = ind.with_energy(raw=-500.0 - i, grand_canonical=-1.0 - i * 0.1)
         temp_db.update(updated)

@@ -1,7 +1,7 @@
 """
 galoop/science/reproduce.py
 
-GA operators: splice, merge, add / remove / displace mutations.
+GA operators: splice, merge, add / remove / displace / translate mutations.
 """
 
 from __future__ import annotations
@@ -12,8 +12,58 @@ from typing import Tuple
 import numpy as np
 from ase import Atoms
 from ase.constraints import FixAtoms
+from ase.data import covalent_radii
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Molecule connectivity helper
+# ---------------------------------------------------------------------------
+
+def _group_molecules(atoms: Atoms, n_slab: int, mult: float = 1.25) -> list[list[int]]:
+    """Group adsorbate atoms into connected molecules using covalent radii.
+
+    Two adsorbate atoms are considered bonded when their distance is less than
+    ``mult * (r_cov_i + r_cov_j)``.  This is element-aware and handles all
+    common adsorbates (CO, OH, NH3, hydrocarbons, …) without a hard-coded
+    distance threshold.
+
+    Returns a list of groups, where each group is a list of absolute atom
+    indices (>= n_slab).  Isolated atoms form single-atom groups.
+    """
+    ads_indices = list(range(n_slab, len(atoms)))
+    if not ads_indices:
+        return []
+
+    pos = atoms.get_positions()
+    nums = atoms.get_atomic_numbers()
+    n = len(ads_indices)
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
+            cutoff = mult * (covalent_radii[nums[ads_indices[i]]]
+                             + covalent_radii[nums[ads_indices[j]]])
+            if np.linalg.norm(pos[ads_indices[i]] - pos[ads_indices[j]]) < cutoff:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    visited = [False] * n
+    molecules: list[list[int]] = []
+    for start in range(n):
+        if visited[start]:
+            continue
+        component: list[int] = []
+        stack = [start]
+        while stack:
+            node = stack.pop()
+            if visited[node]:
+                continue
+            visited[node] = True
+            component.append(ads_indices[node])
+            stack.extend(adj[node])
+        molecules.append(component)
+    return molecules
 
 
 # ---------------------------------------------------------------------------
@@ -27,58 +77,59 @@ def splice(
     rng: np.random.Generator | None = None,
 ) -> Tuple[Atoms, Atoms]:
     """
-    Z-cut splice: keep slab + low adsorbates from A, high from B (and vice
-    versa).
+    Molecule-aware Z-cut splice.
+
+    Groups adsorbate atoms into connected molecules, then assigns each whole
+    molecule to "below" or "above" the Z-cut based on its first atom's z.
+    This prevents molecules from being split across the two children.
 
     Returns two children.  If either parent has no adsorbates the
     corresponding child is a plain copy.
     """
     rng = rng or np.random.default_rng()
 
-    pos_a = parent_a.get_positions()
-    pos_b = parent_b.get_positions()
-    ads_a = pos_a[n_slab:]
-    ads_b = pos_b[n_slab:]
-    sym_a = parent_a.get_chemical_symbols()
-    sym_b = parent_b.get_chemical_symbols()
+    mols_a = _group_molecules(parent_a, n_slab)
+    mols_b = _group_molecules(parent_b, n_slab)
 
-    if len(ads_a) == 0 or len(ads_b) == 0:
+    if not mols_a or not mols_b:
         return parent_a.copy(), parent_b.copy()
 
-    z_lo = min(np.min(ads_a[:, 2]), np.min(ads_b[:, 2]))
-    z_hi = max(np.max(ads_a[:, 2]), np.max(ads_b[:, 2]))
-    z_cut = rng.uniform(z_lo, z_hi)
+    pos_a = parent_a.get_positions()
+    pos_b = parent_b.get_positions()
 
-    def _build_child(base: Atoms, keep_below, donor_above_pos, donor_above_sym):
+    # Z-cut is drawn from the range of all adsorbate binding-atom z values
+    z_all = (
+        [pos_a[mol[0], 2] for mol in mols_a]
+        + [pos_b[mol[0], 2] for mol in mols_b]
+    )
+    z_cut = rng.uniform(min(z_all), max(z_all))
+
+    def _build_child(base: Atoms, keep_mols, donor_mols, donor_atoms: Atoms):
         child = Atoms(
             symbols=base.get_chemical_symbols()[:n_slab],
-            positions=base.get_positions()[:n_slab],
+            positions=pos_a[:n_slab] if base is parent_a else pos_b[:n_slab],
             cell=base.get_cell(),
             pbc=base.get_pbc(),
         )
         child.set_constraint(FixAtoms(indices=list(range(n_slab))))
-        # Low adsorbates from base
-        for idx in np.where(keep_below)[0]:
-            child.append(Atoms(base.get_chemical_symbols()[n_slab + idx],
-                               positions=[base.get_positions()[n_slab + idx]]))
-        # High adsorbates from donor
-        for pos, sym in zip(donor_above_pos, donor_above_sym):
-            child.append(Atoms(sym, positions=[pos]))
+        syms_base = base.get_chemical_symbols()
+        syms_donor = donor_atoms.get_chemical_symbols()
+        pos_donor = donor_atoms.get_positions()
+        for mol in keep_mols:
+            for idx in mol:
+                child.extend(Atoms(syms_base[idx], positions=[base.get_positions()[idx]]))
+        for mol in donor_mols:
+            for idx in mol:
+                child.extend(Atoms(syms_donor[idx], positions=[pos_donor[idx]]))
         return child
 
-    mask_a_low = ads_a[:, 2] < z_cut
-    mask_b_high = ads_b[:, 2] >= z_cut
-    mask_b_low = ads_b[:, 2] < z_cut
-    mask_a_high = ads_a[:, 2] >= z_cut
+    mols_a_low  = [m for m in mols_a if pos_a[m[0], 2] <  z_cut]
+    mols_a_high = [m for m in mols_a if pos_a[m[0], 2] >= z_cut]
+    mols_b_low  = [m for m in mols_b if pos_b[m[0], 2] <  z_cut]
+    mols_b_high = [m for m in mols_b if pos_b[m[0], 2] >= z_cut]
 
-    child1 = _build_child(
-        parent_a, mask_a_low,
-        ads_b[mask_b_high], [sym_b[n_slab + i] for i in np.where(mask_b_high)[0]],
-    )
-    child2 = _build_child(
-        parent_b, mask_b_low,
-        ads_a[mask_a_high], [sym_a[n_slab + i] for i in np.where(mask_a_high)[0]],
-    )
+    child1 = _build_child(parent_a, mols_a_low,  mols_b_high, parent_b)
+    child2 = _build_child(parent_b, mols_b_low,  mols_a_high, parent_a)
     return child1, child2
 
 
@@ -92,15 +143,28 @@ def merge(
     n_slab: int,
     rng: np.random.Generator | None = None,
 ) -> Atoms:
-    """Combine adsorbates from both parents onto A's slab."""
+    """Combine adsorbates from both parents onto A's slab.
+
+    Adsorbates from B are added one whole molecule at a time.  A molecule is
+    only accepted if none of its atoms clash with the current child (scale
+    0.7× covalent radii); if any atom would clash the entire molecule is
+    dropped.  This prevents orphan atoms (e.g. O without C) in the child.
+    """
+    from galoop.science.surface import check_clash
+
     child = parent_a.copy()
     child.set_constraint(FixAtoms(indices=list(range(n_slab))))
 
-    ads_pos = parent_b.get_positions()[n_slab:]
-    ads_sym = parent_b.get_chemical_symbols()[n_slab:]
+    syms_b = parent_b.get_chemical_symbols()
+    pos_b  = parent_b.get_positions()
 
-    if len(ads_pos) > 0:
-        child.extend(Atoms(symbols=ads_sym, positions=ads_pos))
+    for mol in _group_molecules(parent_b, n_slab):
+        trial = child.copy()
+        for idx in mol:
+            trial.extend(Atoms(symbols=[syms_b[idx]], positions=[pos_b[idx]]))
+        if not check_clash(trial, n_slab=len(child), scale=0.7):
+            child = trial
+
     return child
 
 
@@ -138,21 +202,60 @@ def mutate_remove(
     symbol: str | None = None,
     rng: np.random.Generator | None = None,
 ) -> Atoms | None:
-    """Remove one random adsorbate atom.  Returns ``None`` if nothing to remove."""
+    """Remove one random adsorbate molecule.  Returns ``None`` if nothing to remove.
+
+    Removes the entire connected molecule that contains the randomly chosen
+    atom, preventing orphan atoms (e.g. O left behind after removing C from CO).
+    If *symbol* is given, only molecules whose binding atom (first in group)
+    matches that symbol are eligible.
+    """
     rng = rng or np.random.default_rng()
     if len(atoms) <= n_slab:
         return None
 
-    ads_indices = list(range(n_slab, len(atoms)))
+    molecules = _group_molecules(atoms, n_slab)
+    if not molecules:
+        return None
+
     if symbol:
         syms = atoms.get_chemical_symbols()
-        ads_indices = [i for i in ads_indices if syms[i] == symbol]
-        if not ads_indices:
+        molecules = [m for m in molecules if syms[m[0]] == symbol]
+        if not molecules:
             return None
 
-    idx = int(rng.choice(ads_indices))
+    mol = molecules[int(rng.integers(len(molecules)))]
+    remove_set = set(mol)
     child = atoms.copy()
-    del child[idx]
+    # Delete in reverse order to keep indices stable
+    for idx in sorted(remove_set, reverse=True):
+        del child[idx]
+    return child
+
+
+def mutate_rattle_slab(
+    atoms: Atoms,
+    n_slab: int,
+    amplitude: float = 0.1,
+    rng: np.random.Generator | None = None,
+) -> Atoms:
+    """Displace unfixed slab surface atoms by Gaussian noise.
+
+    Only slab atoms not covered by a FixAtoms constraint are rattled.
+    Adsorbate atoms (indices >= n_slab) are untouched.
+    """
+    rng = rng or np.random.default_rng()
+    child = atoms.copy()
+
+    fixed: set[int] = set()
+    for constraint in child.constraints:
+        if isinstance(constraint, FixAtoms):
+            fixed.update(int(i) for i in constraint.index)
+
+    pos = child.get_positions()
+    for i in range(n_slab):
+        if i not in fixed:
+            pos[i] += rng.normal(0.0, amplitude, size=3)
+    child.set_positions(pos)
     return child
 
 
@@ -182,6 +285,39 @@ def mutate_displace(
     delta = rng.normal(0, displacement / 3, size=3)
     pos = child.get_positions()
     pos[idx] += delta
+    child.set_positions(pos)
+    return child
+
+
+def mutate_translate(
+    atoms: Atoms,
+    n_slab: int,
+    displacement: float = 0.8,
+    rng: np.random.Generator | None = None,
+) -> Atoms | None:
+    """Translate one entire adsorbate molecule as a rigid body.
+
+    Picks a random connected molecule from the adsorbate layer and displaces
+    all its atoms by the same random vector (Gaussian, sigma=displacement in
+    x/y, sigma=displacement*0.3 in z).  Returns ``None`` if no adsorbates.
+    """
+    rng = rng or np.random.default_rng()
+    molecules = _group_molecules(atoms, n_slab)
+    if not molecules:
+        return None
+
+    mol = molecules[int(rng.integers(len(molecules)))]
+    child = atoms.copy()
+    child.set_constraint(FixAtoms(indices=list(range(n_slab))))
+
+    delta = np.array([
+        rng.normal(0, displacement),
+        rng.normal(0, displacement),
+        rng.normal(0, displacement * 0.3),
+    ])
+    pos = child.get_positions()
+    for idx in mol:
+        pos[idx] += delta
     child.set_positions(pos)
     return child
 
@@ -217,4 +353,8 @@ def mutation_operator(
         return mutate_remove(atoms, n_slab, symbol, rng=rng)
     elif operator_type == "displace":
         return mutate_displace(atoms, n_slab, symbol, rng=rng)
+    elif operator_type == "rattle_slab":
+        return mutate_rattle_slab(atoms, n_slab, rng=rng)
+    elif operator_type == "translate":
+        return mutate_translate(atoms, n_slab, rng=rng)
     raise ValueError(f"Unknown mutation operator: {operator_type}")

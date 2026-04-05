@@ -107,6 +107,25 @@ class FingerprintConfig(BaseModel):
         description="Min cosine similarity for distance histogram gate")
 
 
+class OperatorWeightsConfig(BaseModel):
+    splice: float = Field(default=0.30, ge=0.0)
+    merge: float = Field(default=0.20, ge=0.0)
+    mutate_add: float = Field(default=0.15, ge=0.0)
+    mutate_remove: float = Field(default=0.10, ge=0.0)
+    mutate_displace: float = Field(default=0.10, ge=0.0)
+    mutate_rattle_slab: float = Field(default=0.05, ge=0.0)
+    mutate_translate: float = Field(default=0.10, ge=0.0)
+
+    @model_validator(mode="after")
+    def _nonzero_sum(self) -> "OperatorWeightsConfig":
+        total = (self.splice + self.merge + self.mutate_add
+                 + self.mutate_remove + self.mutate_displace
+                 + self.mutate_rattle_slab + self.mutate_translate)
+        if total <= 0:
+            raise ValueError("Operator weights must sum to a positive value")
+        return self
+
+
 class GAConfig(BaseModel):
     population_size: int = Field(default=20, ge=2)
     max_structures: int = Field(default=1000, ge=1)
@@ -114,6 +133,18 @@ class GAConfig(BaseModel):
     max_stall: int = Field(default=10, ge=1)
     min_adsorbates: int = Field(default=1, ge=0)
     max_adsorbates: int = Field(default=8, ge=1)
+    boltzmann_temperature: float = Field(
+        default=0.1, gt=0.0,
+        description="kT-like scale for Boltzmann parent selection (eV)",
+    )
+    rattle_amplitude: float = Field(
+        default=0.1, gt=0.0,
+        description="Gaussian sigma for slab surface rattling (Å)",
+    )
+    operator_weights: OperatorWeightsConfig = Field(
+        default_factory=OperatorWeightsConfig,
+        description="Relative probabilities for each GA operator",
+    )
 
     @model_validator(mode="after")
     def _struct_bounds(self) -> GAConfig:

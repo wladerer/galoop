@@ -2,7 +2,7 @@
 tests/test_population.py
 
 Tests for initial population building and offspring spawning.
-Covers structure files, DB entries, stoichiometry variation, and operator tracking.
+Covers structure files, job entries, stoichiometry variation, and operator tracking.
 """
 
 from __future__ import annotations
@@ -20,18 +20,18 @@ from galoop.individual import OPERATOR, STATUS
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _build_pop(minimal_config, slab_info, db, tmp_path, seed=42):
+def _build_pop(minimal_config, slab_info, project, seed=42):
     from galoop.galoop import _build_initial_population
     rng = np.random.default_rng(seed)
-    _build_initial_population(minimal_config, slab_info, db, tmp_path, rng)
+    _build_initial_population(minimal_config, slab_info, project, rng)
 
 
-def _spawn_n(n, run_dir, db, config, slab_info, seed=7):
+def _spawn_n(n, project, config, slab_info, seed=7):
     from galoop.galoop import _spawn_one
     rng = np.random.default_rng(seed)
     results = []
     for _ in range(n):
-        ind = _spawn_one(run_dir, db, config, slab_info, rng)
+        ind = _spawn_one(project, config, slab_info, rng)
         if ind is not None:
             results.append(ind)
     return results
@@ -43,60 +43,58 @@ def _spawn_n(n, run_dir, db, config, slab_info, seed=7):
 
 class TestInitialPopulation:
 
-    def test_structure_count(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_structure_count(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         pending = temp_db.get_by_status(STATUS.PENDING)
         assert len(pending) == minimal_config.ga.population_size
 
-    def test_poscar_files_written(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_poscar_files_written(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         for ind in temp_db.get_by_status(STATUS.PENDING):
             assert ind.geometry_path is not None
             assert Path(ind.geometry_path).exists()
 
-    def test_pending_sentinels_written(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
-        gcga_dir = tmp_path / "gcga"
-        struct_dirs = sorted(gcga_dir.glob("structure_?????"))
-        assert len(struct_dirs) == minimal_config.ga.population_size
-        for d in struct_dirs:
-            assert (d / "PENDING").exists()
+    def test_all_jobs_start_as_pending(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
+        for ind in temp_db.get_by_status(STATUS.PENDING):
+            job = temp_db.get_job_by_id(ind.id)
+            assert job.doc.get("status") == STATUS.PENDING
 
-    def test_all_db_entries_pending(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_all_db_entries_pending(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         for ind in temp_db.get_by_status(STATUS.PENDING):
             assert ind.status == STATUS.PENDING
             assert ind.raw_energy is None
             assert ind.grand_canonical_energy is None
 
-    def test_all_use_init_operator(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_all_use_init_operator(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         for ind in temp_db.get_by_status(STATUS.PENDING):
             assert ind.operator == OPERATOR.INIT
 
-    def test_adsorbate_counts_stored(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_adsorbate_counts_stored(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         for ind in temp_db.get_by_status(STATUS.PENDING):
             counts = ind.extra_data.get("adsorbate_counts", {})
             assert isinstance(counts, dict)
             assert len(counts) > 0
 
-    def test_adsorbate_total_within_bounds(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_adsorbate_total_within_bounds(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         for ind in temp_db.get_by_status(STATUS.PENDING):
             total = sum(ind.extra_data["adsorbate_counts"].values())
             assert minimal_config.ga.min_adsorbates <= total <= minimal_config.ga.max_adsorbates
 
-    def test_stoichiometry_varies_across_population(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_stoichiometry_varies_across_population(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         stoichiometries = {
             frozenset(ind.extra_data["adsorbate_counts"].items())
             for ind in temp_db.get_by_status(STATUS.PENDING)
         }
         assert len(stoichiometries) > 1, "all structures have identical stoichiometry"
 
-    def test_no_duplicate_ids(self, tmp_path, minimal_config, slab_info, temp_db):
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+    def test_no_duplicate_ids(self, minimal_config, slab_info, temp_db):
+        _build_pop(minimal_config, slab_info, temp_db)
         ids = [ind.id for ind in temp_db.get_by_status(STATUS.PENDING)]
         assert len(ids) == len(set(ids))
 
@@ -107,60 +105,56 @@ class TestInitialPopulation:
 
 class TestSpawnOffspring:
 
-    def test_spawn_creates_poscar(self, tmp_path, minimal_config, slab_info, converged_population):
+    def test_spawn_creates_poscar(self, minimal_config, slab_info, converged_population, temp_db):
         from galoop.galoop import _spawn_one
         rng = np.random.default_rng(1)
-        # Use same temp_db implicitly via converged_population fixture
-        from galoop.database import GaloopDB
-        db_path = tmp_path / "test.db"
-        with GaloopDB(db_path) as db:
-            ind = _spawn_one(tmp_path, db, minimal_config, slab_info, rng)
+        ind = _spawn_one(temp_db, minimal_config, slab_info, rng)
         assert ind is not None
-        assert Path(ind.geometry_path).exists()
+        job = temp_db.get_job_by_id(ind.id)
+        assert (Path(job.path) / "POSCAR").exists()
 
-    def test_spawn_adds_db_entry(self, tmp_path, minimal_config, slab_info, temp_db, converged_population):
-        offspring = _spawn_n(3, tmp_path, temp_db, minimal_config, slab_info)
+    def test_spawn_adds_job_entry(self, minimal_config, slab_info, temp_db, converged_population):
+        offspring = _spawn_n(3, temp_db, minimal_config, slab_info)
         assert len(offspring) == 3
         for ind in offspring:
             stored = temp_db.get(ind.id)
             assert stored is not None
             assert stored.status == STATUS.PENDING
 
-    def test_spawn_starts_as_pending(self, tmp_path, minimal_config, slab_info, temp_db, converged_population):
-        offspring = _spawn_n(1, tmp_path, temp_db, minimal_config, slab_info)
+    def test_spawn_starts_as_pending(self, minimal_config, slab_info, temp_db, converged_population):
+        offspring = _spawn_n(1, temp_db, minimal_config, slab_info)
         assert offspring[0].status == STATUS.PENDING
 
     def test_spawn_records_parent_ids_for_ga_operators(
-        self, tmp_path, minimal_config, slab_info, temp_db, converged_population
+        self, minimal_config, slab_info, temp_db, converged_population
     ):
-        offspring = _spawn_n(20, tmp_path, temp_db, minimal_config, slab_info, seed=99)
+        offspring = _spawn_n(20, temp_db, minimal_config, slab_info, seed=99)
         ga_offspring = [o for o in offspring if o.operator != OPERATOR.INIT]
         assert ga_offspring, "expected at least one GA operator to succeed"
         for ind in ga_offspring:
             assert len(ind.parent_ids) >= 1
 
     def test_spawn_operator_variety(
-        self, tmp_path, minimal_config, slab_info, temp_db, converged_population
+        self, minimal_config, slab_info, temp_db, converged_population
     ):
-        offspring = _spawn_n(30, tmp_path, temp_db, minimal_config, slab_info, seed=5)
+        offspring = _spawn_n(30, temp_db, minimal_config, slab_info, seed=5)
         operators_used = {o.operator for o in offspring}
         assert len(operators_used) >= 2, f"only one operator seen: {operators_used}"
 
     def test_spawn_falls_back_to_random_when_pool_empty(
-        self, tmp_path, minimal_config, slab_info, temp_db
+        self, minimal_config, slab_info, temp_db
     ):
-        # Empty DB — no selectable pool
         from galoop.galoop import _spawn_one
-        _build_pop(minimal_config, slab_info, temp_db, tmp_path)
+        _build_pop(minimal_config, slab_info, temp_db)
         rng = np.random.default_rng(42)
-        ind = _spawn_one(tmp_path, temp_db, minimal_config, slab_info, rng)
+        ind = _spawn_one(temp_db, minimal_config, slab_info, rng)
         assert ind is not None
         assert ind.operator == OPERATOR.INIT
 
     def test_spawn_stoichiometry_variation(
-        self, tmp_path, minimal_config, slab_info, temp_db, converged_population
+        self, minimal_config, slab_info, temp_db, converged_population
     ):
-        offspring = _spawn_n(15, tmp_path, temp_db, minimal_config, slab_info, seed=13)
+        offspring = _spawn_n(15, temp_db, minimal_config, slab_info, seed=13)
         stoichiometries = {
             frozenset(o.extra_data.get("adsorbate_counts", {}).items())
             for o in offspring
@@ -168,36 +162,35 @@ class TestSpawnOffspring:
         assert len(stoichiometries) > 1, "all offspring have identical stoichiometry"
 
     def test_spawn_non_init_has_parent_ids(
-        self, tmp_path, minimal_config, slab_info, temp_db, converged_population
+        self, minimal_config, slab_info, temp_db, converged_population
     ):
-        offspring = _spawn_n(20, tmp_path, temp_db, minimal_config, slab_info, seed=99)
+        offspring = _spawn_n(20, temp_db, minimal_config, slab_info, seed=99)
         ga_offspring = [o for o in offspring if o.operator != OPERATOR.INIT]
         assert ga_offspring, "expected at least one GA operator offspring"
         for ind in ga_offspring:
             assert len(ind.parent_ids) >= 1
 
     def test_spawn_boltzmann_weights_realistic_energies(
-        self, tmp_path, minimal_config, slab_info, temp_db
+        self, minimal_config, slab_info, temp_db
     ):
         """Boltzmann selection must not overflow with DFT-scale energies (~-300 eV)."""
-        import shutil
         import warnings
         from galoop.galoop import _build_initial_population, _spawn_one
 
         rng = np.random.default_rng(42)
-        _build_initial_population(minimal_config, slab_info, temp_db, tmp_path, rng)
+        _build_initial_population(minimal_config, slab_info, temp_db, rng)
 
-        # Converge structures with realistic MACE/DFT total energies
         for i, ind in enumerate(temp_db.get_by_status(STATUS.PENDING)):
-            poscar = Path(ind.geometry_path)
-            shutil.copy(poscar, poscar.parent / "CONTCAR")
-            energy = -320.0 - i * 5.0          # e.g. -320, -325, -330 … eV
+            job = temp_db.get_job_by_id(ind.id)
+            poscar = Path(job.path) / "POSCAR"
+            shutil.copy(poscar, Path(job.path) / "CONTCAR")
+            energy = -320.0 - i * 5.0
             temp_db.update(ind.with_energy(raw=energy, grand_canonical=energy))
 
         rng2 = np.random.default_rng(7)
         with warnings.catch_warnings():
-            warnings.simplefilter("error")      # overflow → test failure
-            ind = _spawn_one(tmp_path, temp_db, minimal_config, slab_info, rng2)
+            warnings.simplefilter("error")
+            ind = _spawn_one(temp_db, minimal_config, slab_info, rng2)
 
         assert ind is not None
 
@@ -249,20 +242,16 @@ class TestOrientUpright:
         np.testing.assert_allclose(com_after, com_before, atol=1e-6)
 
     def test_already_upright_unchanged(self):
-        """A molecule already oriented correctly should not be rotated."""
         from ase import Atoms
         from galoop.science.surface import orient_upright
-        # O below, H above — already correct
         oh = Atoms("OH", positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.97]])
         result = orient_upright(oh)
         o_z = result.get_positions()[0, 2]
         assert o_z < result.get_center_of_mass()[2]
 
     def test_nonzero_binding_index(self):
-        """binding_index selects which atom faces the surface."""
         from ase import Atoms
         from galoop.science.surface import orient_upright
-        # H2O: H H O — bind via O at index 2
         h2o = Atoms("HHO", positions=[[0.0, 0.0, 0.5], [0.0, 0.5, 0.5], [0.0, 0.0, 0.0]])
         result = orient_upright(h2o, binding_index=2)
         o_z = result.get_positions()[2, 2]
@@ -271,12 +260,10 @@ class TestOrientUpright:
     def test_out_of_range_binding_index_raises(self):
         from ase.build import molecule
         from galoop.science.surface import orient_upright
-        import pytest
         with pytest.raises(ValueError, match="binding_index"):
             orient_upright(molecule("OH"), binding_index=5)
 
     def test_placed_adsorbate_o_below_h(self, slab_info):
-        """After placement, O should be closer to the surface than H."""
         from ase.build import molecule
         from galoop.science.surface import place_adsorbate
         oh = molecule("OH")

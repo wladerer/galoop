@@ -47,6 +47,8 @@ class OPERATOR:
     MUTATE_ADD = "mutate_add"
     MUTATE_REMOVE = "mutate_remove"
     MUTATE_DISPLACE = "mutate_displace"
+    MUTATE_RATTLE_SLAB = "mutate_rattle_slab"
+    MUTATE_TRANSLATE = "mutate_translate"
 
 
 # ---------------------------------------------------------------------------

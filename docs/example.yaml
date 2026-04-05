@@ -1,72 +1,80 @@
-
-# gocia.yaml — Example configuration for a lean GOCIA run
-# Hybrid MACE + VASP workflow
+# galoop.yaml — example configuration
+# See quickstart.md for full documentation.
 
 slab:
-  geometry: slab.vasp           # VASP POSCAR/CONTCAR
-  energy: -125.0                # DFT energy of bare slab (eV)
-  sampling_zmin: 10.0           # Min z for adsorbate placement (Å)
-  sampling_zmax: 15.0           # Max z for adsorbate placement (Å)
+  geometry: slab.vasp
+  energy: -135.87            # bare slab energy from your calculator (eV)
+  sampling_zmin: 14.9        # bottom of adsorbate placement window (Å)
+  sampling_zmax: 15.9        # top of adsorbate placement window (Å)
 
 adsorbates:
-  - symbol: O
-    chemical_potential: -4.92
-    n_orientations: 1
-    min_count: 0
-    max_count: 4
-
   - symbol: OH
-    chemical_potential: -3.75
-    n_orientations: 3
+    chemical_potential: -7.2
+    binding_index: 0           # O binds to surface
+    coordinates:
+      - [0.0, 0.0, 0.0]        # O at binding site
+      - [0.0, 0.0, 0.97]       # H pointing up
     min_count: 0
     max_count: 3
 
+  - symbol: CO
+    chemical_potential: -14.1
+    binding_index: 0           # C binds to surface
+    coordinates:
+      - [0.0, 0.0, 0.0]
+      - [0.0, 0.0, 1.15]
+    min_count: 0
+    max_count: 3
+
+# Single MACE stage — swap in VASP stages for production DFT
 calculator_stages:
-  # Stage 1: Fast pre-optimization with MACE
-  - name: mace_preopt
+  - name: relax
     type: mace
-    fmax: 0.10
-    max_steps: 300
-
-  # Stage 2: Coarse VASP relaxation
-  - name: vasp_coarse
-    type: vasp
     fmax: 0.05
-    max_steps: 100
-    incar:
-      ENCUT: 400
-      EDIFF: 1.0e-5
-      ISMEAR: 0
-      SIGMA: 0.05
+    max_steps: 300
+    fix_slab_first: true     # pre-relax adsorbates with slab frozen
 
-  # Stage 3: Fine VASP relaxation (for fitness evaluation)
-  - name: vasp_fine
-    type: vasp
-    fmax: 0.02
-    max_steps: 100
-    incar:
-      ENCUT: 520
-      EDIFF: 1.0e-6
-      ISMEAR: 0
-      SIGMA: 0.05
+# Example two-stage MACE → VASP workflow:
+#   - name: preopt
+#     type: mace
+#     fmax: 0.10
+#     max_steps: 200
+#   - name: dft
+#     type: vasp
+#     fmax: 0.05
+#     max_steps: 100
+#     incar: {ENCUT: 520, EDIFF: 1.0e-6, ISMEAR: 0, SIGMA: 0.05}
+
+mace_model: small            # small | medium | large | path/to/custom.pt
+mace_device: cpu             # cpu | cuda | auto
+mace_dtype: float32
 
 scheduler:
-  type: local              # local | slurm | pbs
-  nworkers: 4             # Max concurrent jobs
-  walltime: "01:00:00"    # HH:MM:SS
+  type: local                # local | slurm | pbs
+  nworkers: 4                # max pending jobs spawned at once
 
 ga:
   population_size: 20
-  max_generations: 100
-  min_generations: 5
-  max_stall_generations: 10
+  max_structures: 500
+  min_structures: 100
+  max_stall: 15              # poll cycles with no GCE improvement before stopping
   min_adsorbates: 1
-  max_adsorbates: 7
+  max_adsorbates: 4
+  boltzmann_temperature: 0.15  # eV — parent selection sharpness
+  rattle_amplitude: 0.10       # Å — slab surface perturbation sigma
+  operator_weights:
+    splice: 0.30
+    merge: 0.20
+    mutate_add: 0.15
+    mutate_remove: 0.10
+    mutate_displace: 0.10
+    mutate_rattle_slab: 0.05
+    mutate_translate: 0.10
 
 conditions:
-  temperature: 298.15     # K
-  pressure: 1.0          # atm
-  potential: 0.0         # V vs RHE
+  temperature: 298.15
+  pressure: 1.0
+  potential: 0.0             # V vs RHE
   pH: 0.0
 
 fingerprint:
@@ -74,6 +82,4 @@ fingerprint:
   n_max: 8
   l_max: 6
   duplicate_threshold: 0.90
-
-mace_model: medium        # small | medium | large
-mace_device: cpu          # cpu | cuda | auto
+  dist_hist_threshold: 0.95

@@ -3,8 +3,18 @@ galoop/report.py
 
 Generate a self-contained HTML status report for a galoop run.
 
-No external dependencies — everything (CSS, JS, SVG) is inlined so
-the file works offline and can be shared as a single document.
+Core sections (pure SVG, no external deps, works offline):
+  - Summary cards
+  - Status breakdown
+  - GCE evolution scatter
+  - Operator performance stacked bar
+  - Coverage landscape strip chart
+  - Adsorbate sampling heatmap
+  - Duplicate clustering table
+  - Top-N structures table
+
+3D structure viewer (requires internet for 3Dmol.js CDN):
+  - Interactive viewer for top structures using 3Dmol.js
 """
 
 from __future__ import annotations
@@ -74,6 +84,10 @@ def _collect_adsorbate_xy(df, n_slab_atoms: int) -> list[tuple[float, float]]:
     return xys
 
 
+# ---------------------------------------------------------------------------
+# SVG helpers
+# ---------------------------------------------------------------------------
+
 def _svg_heatmap(
     xys: list[tuple[float, float]],
     a_len: float,
@@ -121,13 +135,10 @@ def _svg_heatmap(
                 f'width="{bw:.2f}" height="{bh:.2f}" fill="{_viridis(t)}"/>'
             )
 
-    # Cell outline
     lines.append(
         f'<rect x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" '
         f'fill="none" stroke="#aaa" stroke-width="1"/>'
     )
-
-    # Axis labels
     lines += [
         f'<text x="{pad_l + plot_w / 2}" y="{height - 4}" '
         f'text-anchor="middle" fill="#aaa" font-size="11">a ({a_len:.2f} Å)</text>',
@@ -138,7 +149,6 @@ def _svg_heatmap(
         f'{len(xys)} adsorbate atom positions</text>',
     ]
 
-    # Colorbar
     cb_x = pad_l + plot_w + 10
     cb_w, n_stops = 14, 20
     for i in range(n_stops):
@@ -157,7 +167,6 @@ def _svg_heatmap(
         f'<text x="{cb_x + cb_w + 4}" y="{pad_t + plot_h}" '
         f'fill="#888" font-size="9" dominant-baseline="middle">0</text>',
     ]
-
     lines.append("</svg>")
     return "\n".join(lines)
 
@@ -172,10 +181,6 @@ _STATUS_COLOR = {
 }
 _STATUS_ORDER = ["converged", "pending", "submitted", "failed", "desorbed", "duplicate"]
 
-
-# ---------------------------------------------------------------------------
-# SVG helpers
-# ---------------------------------------------------------------------------
 
 def _svg_scatter(
     xs: list[float],
@@ -199,7 +204,6 @@ def _svg_scatter(
 
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
-    # Add a small margin around y
     y_margin = max((max_y - min_y) * 0.08, 0.05)
     min_y -= y_margin
     max_y += y_margin
@@ -214,7 +218,6 @@ def _svg_scatter(
             return pad_t + plot_h / 2
         return pad_t + (1.0 - (v - min_y) / (max_y - min_y)) * plot_h
 
-    # Axis tick values
     n_y_ticks = 5
     y_step = (max_y - min_y) / n_y_ticks
     y_ticks = [min_y + i * y_step for i in range(n_y_ticks + 1)]
@@ -222,19 +225,16 @@ def _svg_scatter(
     lines = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
         f'style="background:#1e2a3a;border-radius:6px">',
-        # Grid lines
         *(
             f'<line x1="{pad_l}" y1="{py(t):.1f}" x2="{width - pad_r}" y2="{py(t):.1f}" '
             f'stroke="#2c3e50" stroke-width="1"/>'
             for t in y_ticks
         ),
-        # Y-axis labels
         *(
             f'<text x="{pad_l - 6}" y="{py(t):.1f}" text-anchor="end" '
             f'fill="#888" font-size="10" dominant-baseline="middle">{t:.2f}</text>'
             for t in y_ticks
         ),
-        # X-axis labels (a few evenly spaced)
     ]
 
     n_x_ticks = min(6, len(xs))
@@ -247,7 +247,6 @@ def _svg_scatter(
                 f'fill="#888" font-size="10">{int(round(xv))}</text>'
             )
 
-    # Axis labels
     lines += [
         f'<text x="{pad_l + plot_w // 2}" y="{height - 0}" '
         f'text-anchor="middle" fill="#aaa" font-size="11">Evaluation</text>',
@@ -256,14 +255,12 @@ def _svg_scatter(
         f'transform="rotate(-90,12,{pad_t + plot_h // 2})">G (eV)</text>',
     ]
 
-    # Running minimum line
     if len(run_min) > 1:
         pts = " ".join(f"{px(x):.1f},{py(y):.1f}" for x, y in zip(xs, run_min))
         lines.append(
             f'<polyline points="{pts}" fill="none" stroke="#2ecc71" stroke-width="2"/>'
         )
 
-    # Scatter dots
     for x, y in zip(xs, ys):
         lines.append(
             f'<circle cx="{px(x):.1f}" cy="{py(y):.1f}" r="4" '
@@ -272,6 +269,335 @@ def _svg_scatter(
 
     lines.append("</svg>")
     return "\n".join(lines)
+
+
+def _svg_operator_stats(df, width: int = 700) -> str:
+    """Horizontal stacked bar chart showing converged/duplicate/failed per operator."""
+    from collections import defaultdict
+
+    op_status: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for _, row in df.iterrows():
+        op = str(row.get("operator") or "init")
+        st = str(row.get("status") or "unknown")
+        op_status[op][st] += 1
+
+    if not op_status:
+        return "<p style='color:#7a90a8'>No operator data.</p>"
+
+    # Order: most important statuses first (left to right in bar)
+    bar_statuses = ["converged", "duplicate", "desorbed", "failed", "pending", "submitted"]
+    bar_colors   = {
+        "converged": "#2ecc71", "duplicate": "#95a5a6", "desorbed": "#e67e22",
+        "failed": "#e74c3c", "pending": "#3498db", "submitted": "#f1c40f",
+    }
+
+    ops = sorted(op_status.keys())
+    max_total = max(sum(op_status[op].values()) for op in ops) or 1
+
+    row_h = 30
+    pad_l, pad_r, pad_t, pad_b = 145, 50, 20, 44
+    plot_w = width - pad_l - pad_r
+    h = len(ops) * row_h + pad_t + pad_b
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{h}" '
+        f'style="background:#1e2a3a;border-radius:6px">',
+    ]
+
+    for i, op in enumerate(ops):
+        y = pad_t + i * row_h
+        cy = y + row_h * 0.5
+        lines.append(
+            f'<text x="{pad_l - 8}" y="{cy:.1f}" text-anchor="end" '
+            f'fill="#aaa" font-size="11" dominant-baseline="middle">{op}</text>'
+        )
+        x_cur = float(pad_l)
+        total = sum(op_status[op].values())
+        for st in bar_statuses:
+            cnt = op_status[op].get(st, 0)
+            if cnt == 0:
+                continue
+            bw = cnt / max_total * plot_w
+            color = bar_colors.get(st, "#888")
+            lines.append(
+                f'<rect x="{x_cur:.1f}" y="{y + 5}" width="{bw:.1f}" '
+                f'height="{row_h - 10}" fill="{color}" rx="2"/>'
+            )
+            if bw > 18:
+                lines.append(
+                    f'<text x="{x_cur + bw / 2:.1f}" y="{cy:.1f}" text-anchor="middle" '
+                    f'fill="#000" font-size="9" dominant-baseline="middle" font-weight="600">{cnt}</text>'
+                )
+            x_cur += bw
+        lines.append(
+            f'<text x="{pad_l + plot_w + 6}" y="{cy:.1f}" fill="#7a90a8" '
+            f'font-size="10" dominant-baseline="middle">{total}</text>'
+        )
+
+    # Legend
+    lx = pad_l
+    ly = h - pad_b + 14
+    for st in bar_statuses:
+        color = bar_colors.get(st, "#888")
+        lines += [
+            f'<rect x="{lx}" y="{ly}" width="9" height="9" fill="{color}" rx="1"/>',
+            f'<text x="{lx + 12}" y="{ly + 4.5}" fill="#888" font-size="9" '
+            f'dominant-baseline="middle">{st}</text>',
+        ]
+        lx += 72
+
+    lines.append("</svg>")
+    return "\n".join(lines)
+
+
+def _svg_coverage_strip(individuals, width: int = 700, height: int = 340) -> str:
+    """Strip chart: GCE distribution per adsorbate coverage type."""
+    import numpy as np
+    from collections import defaultdict
+
+    coverage_gce: dict[str, list[float]] = defaultdict(list)
+    for ind in individuals:
+        gce = getattr(ind, "grand_canonical_energy", None)
+        if gce is None:
+            continue
+        counts = (ind.extra_data or {}).get("adsorbate_counts", {})
+        label = " ".join(f"{k}×{v}" for k, v in sorted(counts.items()) if v > 0) or "bare"
+        coverage_gce[label].append(float(gce))
+
+    if not coverage_gce:
+        return (
+            f'<svg width="{width}" height="80" style="background:#1e2a3a;border-radius:6px">'
+            f'<text x="{width//2}" y="40" text-anchor="middle" fill="#888" font-size="14">'
+            f'No coverage data yet</text></svg>'
+        )
+
+    # Sort groups by median GCE (most stable leftmost)
+    groups = sorted(coverage_gce.items(), key=lambda kv: float(np.median(kv[1])))
+
+    pad_l, pad_r, pad_t, pad_b = 65, 20, 24, 80
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    all_gces = [g for _, gs in groups for g in gs]
+    lo, hi = min(all_gces), max(all_gces)
+    margin = max((hi - lo) * 0.10, 0.05)
+    lo -= margin
+    hi += margin
+
+    n_groups = len(groups)
+    x_step = plot_w / max(n_groups, 1)
+
+    def px(i: int) -> float:
+        return pad_l + (i + 0.5) * x_step
+
+    def py(v: float) -> float:
+        if hi == lo:
+            return pad_t + plot_h / 2
+        return pad_t + (1.0 - (v - lo) / (hi - lo)) * plot_h
+
+    palette = [
+        "#e06c75", "#98c379", "#61afef", "#e5c07b",
+        "#c678dd", "#56b6c2", "#d19a66", "#abb2bf",
+    ]
+
+    n_y = 5
+    y_step_v = (hi - lo) / n_y
+    y_ticks = [lo + i * y_step_v for i in range(n_y + 1)]
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'style="background:#1e2a3a;border-radius:6px">',
+        *(
+            f'<line x1="{pad_l}" y1="{py(t):.1f}" x2="{width - pad_r}" y2="{py(t):.1f}" '
+            f'stroke="#2c3e50" stroke-width="1"/>'
+            for t in y_ticks
+        ),
+        *(
+            f'<text x="{pad_l - 6}" y="{py(t):.1f}" text-anchor="end" '
+            f'fill="#888" font-size="10" dominant-baseline="middle">{t:.2f}</text>'
+            for t in y_ticks
+        ),
+        f'<text x="12" y="{pad_t + plot_h / 2:.1f}" text-anchor="middle" fill="#aaa" '
+        f'font-size="11" transform="rotate(-90,12,{pad_t + plot_h / 2:.1f})">G (eV)</text>',
+    ]
+
+    rng = np.random.default_rng(0)
+    for i, (label, gces) in enumerate(groups):
+        x = px(i)
+        color = palette[i % len(palette)]
+        n = len(gces)
+
+        # Thin vertical guide
+        lines.append(
+            f'<line x1="{x:.1f}" y1="{pad_t}" x2="{x:.1f}" y2="{pad_t + plot_h}" '
+            f'stroke="{color}" stroke-width="1" stroke-opacity="0.15"/>'
+        )
+
+        # Min–max range bar
+        if n > 1:
+            y_top = py(max(gces))
+            y_bot = py(min(gces))
+            bar_h = max(abs(y_bot - y_top), 2)
+            lines.append(
+                f'<rect x="{x - 3:.1f}" y="{y_top:.1f}" width="6" height="{bar_h:.1f}" '
+                f'fill="{color}" fill-opacity="0.25" rx="3"/>'
+            )
+
+        # Median line
+        med = float(np.median(gces))
+        lines.append(
+            f'<line x1="{x - 12:.1f}" y1="{py(med):.1f}" x2="{x + 12:.1f}" y2="{py(med):.1f}" '
+            f'stroke="{color}" stroke-width="2.5"/>'
+        )
+
+        # Individual dots with jitter
+        for gce in gces:
+            jit = float(rng.uniform(-min(x_step * 0.3, 8), min(x_step * 0.3, 8))) if n > 1 else 0.0
+            lines.append(
+                f'<circle cx="{x + jit:.1f}" cy="{py(gce):.1f}" r="4" '
+                f'fill="{color}" fill-opacity="0.85"/>'
+            )
+
+        # Rotated x-axis label
+        lx, ly = x, pad_t + plot_h + 10
+        short = label if len(label) <= 14 else label[:13] + "…"
+        lines.append(
+            f'<text x="{lx:.1f}" y="{ly}" text-anchor="end" fill="#aaa" font-size="10" '
+            f'transform="rotate(-40,{lx:.1f},{ly})">{short} (n={n})</text>'
+        )
+
+    lines.append("</svg>")
+    return "\n".join(lines)
+
+
+def _atoms_to_xyz(atoms) -> str:
+    lines = [str(len(atoms)), "galoop"]
+    for atom in atoms:
+        x, y, z = atom.position
+        lines.append(f"{atom.symbol} {x:.6f} {y:.6f} {z:.6f}")
+    return "\n".join(lines)
+
+
+def _structure_viewer_html(best, run_dir: Path, n_slab_atoms: int, n: int = 12) -> str:
+    """Interactive 3Dmol.js viewer for top N structures.
+
+    Requires an internet connection to load 3Dmol.js from CDN.
+    Slab atoms are shown as small translucent spheres; adsorbates as
+    full-size spheres + sticks.
+    """
+    try:
+        from ase.io import read as ase_read
+    except ImportError:
+        return "<p style='color:#7a90a8'>ASE not available for structure viewer.</p>"
+
+    structures = []
+    for ind in best[:n]:
+        geo = ind.geometry_path
+        if not geo:
+            continue
+        contcar = Path(geo).parent / "CONTCAR"
+        poscar  = Path(geo).parent / "POSCAR"
+        src = contcar if contcar.exists() else (poscar if poscar.exists() else None)
+        if src is None:
+            continue
+        try:
+            atoms = ase_read(str(src), format="vasp")
+            gce = f"{ind.grand_canonical_energy:.4f}" if ind.grand_canonical_energy is not None else "N/A"
+            ads = ind.extra_data.get("adsorbate_counts", {})
+            ads_str = " ".join(f"{k}×{v}" for k, v in sorted(ads.items()) if v > 0)
+            structures.append({
+                "id": ind.id,
+                "gce": gce,
+                "ads": ads_str or "—",
+                "op": ind.operator,
+                "n_atoms": len(atoms),
+                "n_slab": n_slab_atoms,
+                "xyz": _atoms_to_xyz(atoms),
+            })
+        except Exception as exc:
+            log.debug("Could not read structure %s: %s", ind.id, exc)
+
+    if not structures:
+        return "<p style='color:#7a90a8'>No structure files found for viewer.</p>"
+
+    structs_json = json.dumps(structures)
+    n_structs = len(structures)
+
+    return f"""<div>
+  <div id="viewer3d" style="width:100%;height:440px;background:#050510;border-radius:6px;overflow:hidden;position:relative"></div>
+  <div style="display:flex;align-items:center;gap:10px;padding:10px 0 4px;flex-wrap:wrap">
+    <button onclick="v3d_show(v3d_cur-1)"
+      style="background:#2d2d5e;color:#e0e0e0;border:1px solid #555;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:13px">&#8592; Prev</button>
+    <span id="v3d-counter" style="font-size:13px;min-width:70px;text-align:center;color:#aaa">1 / {n_structs}</span>
+    <button onclick="v3d_show(v3d_cur+1)"
+      style="background:#2d2d5e;color:#e0e0e0;border:1px solid #555;padding:4px 12px;border-radius:4px;cursor:pointer;font-size:13px">Next &#8594;</button>
+    <span id="v3d-title" style="font-size:12px;color:#7a90a8;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+  </div>
+  <p style="font-size:0.75rem;color:#3a5070;margin:0">
+    Slab atoms: small translucent spheres &nbsp;·&nbsp; Adsorbates: full spheres + sticks
+    &nbsp;·&nbsp; Drag to rotate &nbsp;·&nbsp; Scroll to zoom
+    &nbsp;·&nbsp; <em>Requires internet (3Dmol.js CDN)</em>
+  </p>
+</div>
+<script src="https://3dmol.csb.pitt.edu/build/3Dmol-min.js"></script>
+<script>
+(function() {{
+  const structs = {structs_json};
+  let viewer = null;
+  let v3d_cur = 0;
+  window.v3d_cur = 0;
+
+  function initViewer() {{
+    const el = document.getElementById('viewer3d');
+    if (typeof $3Dmol === 'undefined') {{
+      el.innerHTML = '<p style="color:#e74c3c;padding:20px">Could not load 3Dmol.js — check your internet connection.</p>';
+      return;
+    }}
+    viewer = $3Dmol.createViewer(el, {{backgroundColor: '0x050510', antialias: true}});
+    v3d_show(0);
+  }}
+
+  window.v3d_show = function(i) {{
+    if (!viewer) return;
+    v3d_cur = ((i % structs.length) + structs.length) % structs.length;
+    window.v3d_cur = v3d_cur;
+    const s = structs[v3d_cur];
+    viewer.removeAllModels();
+    viewer.addModel(s.xyz, 'xyz');
+
+    // Slab: small, translucent spheres
+    const slabIdx = Array.from({{length: s.n_slab}}, (_, k) => k);
+    if (slabIdx.length > 0) {{
+      viewer.setStyle({{index: slabIdx}}, {{
+        sphere: {{radius: 0.32, opacity: 0.30, colorscheme: 'Jmol'}}
+      }});
+    }}
+
+    // Adsorbates: full spheres + sticks
+    const adsIdx = Array.from({{length: s.n_atoms - s.n_slab}}, (_, k) => k + s.n_slab);
+    if (adsIdx.length > 0) {{
+      viewer.setStyle({{index: adsIdx}}, {{
+        sphere: {{radius: 0.55, opacity: 0.95, colorscheme: 'Jmol'}},
+        stick:  {{radius: 0.16, colorscheme: 'Jmol'}}
+      }});
+    }}
+
+    viewer.zoomTo({{index: adsIdx.length > 0 ? adsIdx : slabIdx}});
+    viewer.render();
+
+    document.getElementById('v3d-counter').textContent =
+      (v3d_cur + 1) + ' / ' + structs.length;
+    document.getElementById('v3d-title').textContent =
+      s.id + '  G=' + s.gce + ' eV  ' + s.ads + '  op=' + s.op;
+  }};
+
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', initViewer);
+  }} else {{
+    initViewer();
+  }}
+}})();
+</script>"""
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +670,7 @@ def _status_panel(counts: dict[str, int]) -> str:
     return "\n".join(rows)
 
 
-def _chemical_potentials_table(cfg: GaloopConfig) -> str:
+def _chemical_potentials_table(cfg) -> str:
     rows = []
     for ads in cfg.adsorbates:
         rows.append(
@@ -363,7 +689,7 @@ def _chemical_potentials_table(cfg: GaloopConfig) -> str:
     )
 
 
-def _conditions_table(cfg: GaloopConfig) -> str:
+def _conditions_table(cfg) -> str:
     cond = cfg.conditions
     rows = [
         f"<tr><td>Temperature</td><td class='gce'>{cond.temperature:.2f} K</td></tr>",
@@ -427,7 +753,6 @@ def _duplicate_summary(df, threshold: float = 0.90) -> str:
 
     ratio = f"{n_unique} / {n_total_conv}"
 
-    # Build cluster map from extra_data
     clusters: dict[str, list] = {}
     for _, row in dup_df.iterrows():
         extra = row["extra_data"] if isinstance(row["extra_data"], dict) else {}
@@ -436,7 +761,6 @@ def _duplicate_summary(df, threshold: float = 0.90) -> str:
         if dup_of:
             clusters.setdefault(dup_of, []).append(tanimoto)
 
-    # Top-duplicated originals table
     conv_map = {row["id"]: row for _, row in conv_df.iterrows()}
     top = sorted(clusters.items(), key=lambda x: -len(x[1]))[:10]
 
@@ -484,32 +808,34 @@ def _duplicate_summary(df, threshold: float = 0.90) -> str:
 # ---------------------------------------------------------------------------
 
 def generate(
-    db_path: Path,
-    cfg: GaloopConfig,
+    cfg,
     output_path: Path,
     top_n: int = 20,
+    project=None,
+    db_path: Path | None = None,
 ) -> None:
     """
     Write a self-contained HTML report to *output_path*.
 
     Parameters
     ----------
-    db_path     : path to galoop.db
     cfg         : loaded GaloopConfig
     output_path : where to write the .html file
-    top_n       : number of top structures to list
+    top_n       : number of top structures to list in the table
+    project     : GaloopProject (signac-based)
+    db_path     : deprecated, ignored
     """
-    from galoop.database import GaloopDB
+    if project is None:
+        raise ValueError("Pass a GaloopProject via the project= argument")
 
-    with GaloopDB(db_path) as db:
-        db.setup()
-        counts = db.count_by_status()
-        best = db.best(n=top_n)
-        df = db.to_dataframe()
-
+    counts      = project.count_by_status()
+    best        = project.best(n=top_n)
+    all_conv    = project.get_by_status("converged")   # for coverage strip
+    df          = project.to_dataframe()
+    run_dir     = project.run_dir
     dup_threshold = cfg.fingerprint.duplicate_threshold
 
-    # Load slab to determine n_slab_atoms and cell dimensions for the heatmap
+    # Slab geometry for heatmap and 3D viewer
     n_slab_atoms = 0
     a_len = b_len = 0.0
     try:
@@ -517,26 +843,24 @@ def generate(
         from ase.io import read as ase_read
         slab_path = Path(cfg.slab.geometry)
         if not slab_path.is_absolute():
-            slab_path = db_path.parent / slab_path
+            slab_path = run_dir / slab_path
         if slab_path.exists():
             _slab = ase_read(str(slab_path), format="vasp")
             n_slab_atoms = len(_slab)
             a_len = float(np.linalg.norm(_slab.cell[0]))
             b_len = float(np.linalg.norm(_slab.cell[1]))
     except Exception as exc:
-        log.debug("Could not load slab for heatmap: %s", exc)
+        log.debug("Could not load slab: %s", exc)
 
-    heatmap_svg = _svg_heatmap(
-        _collect_adsorbate_xy(df, n_slab_atoms),
-        a_len, b_len,
-    )
+    # Build all SVG / HTML sections
+    heatmap_svg      = _svg_heatmap(_collect_adsorbate_xy(df, n_slab_atoms), a_len, b_len)
+    operator_svg     = _svg_operator_stats(df)
+    coverage_svg     = _svg_coverage_strip(all_conv)
+    viewer_html      = _structure_viewer_html(best, run_dir, n_slab_atoms, n=min(top_n, 15))
 
-    total = sum(counts.values())
-    n_conv = counts.get("converged", 0)
-    n_failed = counts.get("failed", 0)
-    n_desorbed = counts.get("desorbed", 0)
+    total      = sum(counts.values())
+    n_conv     = counts.get("converged", 0)
 
-    # GCE evolution data
     conv_df = df[(df["status"] == "converged") & df["grand_canonical_energy"].notna()]
     xs: list[float] = list(range(1, len(conv_df) + 1))
     ys: list[float] = conv_df["grand_canonical_energy"].tolist()
@@ -546,27 +870,28 @@ def generate(
         cur_min = min(cur_min, y)
         run_min.append(cur_min)
 
-    best_gce = f"{ys[-1] if not run_min else run_min[-1]:.4f} eV" if run_min else "—"
+    best_gce     = f"{run_min[-1]:.4f} eV" if run_min else "—"
     success_rate = f"{n_conv / total * 100:.1f} %" if total > 0 else "—"
-
-    gce_svg = _svg_scatter(xs, ys, run_min)
+    gce_svg      = _svg_scatter(xs, ys, run_min)
 
     import datetime
     generated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_name     = html.escape(run_dir.name)
+    run_path     = html.escape(str(run_dir))
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>galoop report — {html.escape(str(db_path.parent.name))}</title>
+<title>galoop report — {run_name}</title>
 <style>{_css()}</style>
 </head>
 <body>
 
 <h1>galoop run report</h1>
 <p class="subtitle">
-  Run directory: <code>{html.escape(str(db_path.parent))}</code>
+  Run directory: <code>{run_path}</code>
   &nbsp;·&nbsp; Generated: {generated_at}
 </p>
 
@@ -612,20 +937,43 @@ def generate(
 <div class="section card">
   <h2>Grand canonical energy evolution</h2>
   <p style="color:#7a90a8;font-size:0.82rem;margin-bottom:10px">
-    Blue dots — individual evaluations &nbsp;·&nbsp;
-    Green line — running minimum
+    Blue dots — individual evaluations &nbsp;·&nbsp; Green line — running minimum
   </p>
   {gce_svg}
+</div>
+
+<!-- ── Coverage landscape ── -->
+<div class="section card">
+  <h2>Coverage landscape</h2>
+  <p style="color:#7a90a8;font-size:0.82rem;margin-bottom:10px">
+    Each group = one adsorbate stoichiometry &nbsp;·&nbsp;
+    Sorted by median G &nbsp;·&nbsp; Bar = median, dots = individual structures
+  </p>
+  {coverage_svg}
+</div>
+
+<!-- ── Operator performance ── -->
+<div class="section card">
+  <h2>Operator performance</h2>
+  <p style="color:#7a90a8;font-size:0.82rem;margin-bottom:10px">
+    Stacked bars show outcome distribution per operator &nbsp;·&nbsp; Numbers on right = total spawned
+  </p>
+  {operator_svg}
 </div>
 
 <!-- ── Sampling heatmap ── -->
 <div class="section card">
   <h2>Adsorbate sampling coverage</h2>
   <p style="color:#7a90a8;font-size:0.82rem;margin-bottom:10px">
-    Fractional x–y positions of all adsorbate atoms across all structures
-    (CONTCAR preferred, POSCAR fallback) &nbsp;·&nbsp; viridis = visit count
+    Fractional x–y positions of all adsorbate atoms (CONTCAR preferred) &nbsp;·&nbsp; viridis = visit count
   </p>
   {heatmap_svg}
+</div>
+
+<!-- ── 3D structure viewer ── -->
+<div class="section card">
+  <h2>Top structures — 3D viewer</h2>
+  {viewer_html}
 </div>
 
 <!-- ── Duplicate clustering ── -->
@@ -634,7 +982,7 @@ def generate(
   {_duplicate_summary(df, threshold=dup_threshold)}
 </div>
 
-<!-- ── Top structures ── -->
+<!-- ── Top structures table ── -->
 <div class="section card">
   <h2>Top {top_n} structures (by grand canonical energy)</h2>
   {_top_structures_table(best, n=top_n)}

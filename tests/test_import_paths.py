@@ -55,8 +55,10 @@ class TestAllModulesImport:
         assert OPERATOR.INIT == "init"
 
     def test_database(self):
-        from galoop.database import GaloopDB, row_to_individual
-        assert callable(row_to_individual)
+        # database.py is now a shim; GaloopProject is the live implementation
+        from galoop.database import diff_configs
+        from galoop.project import GaloopProject, diff_configs as dc2
+        assert callable(diff_configs)
 
     def test_fingerprint(self):
         from galoop.fingerprint import compute_soap, tanimoto_similarity, classify_postrelax
@@ -71,9 +73,8 @@ class TestAllModulesImport:
         from galoop.engine.calculator import Pipeline, CalculatorStage, build_pipeline
 
     def test_scheduler(self):
-        from galoop.engine.scheduler import relax_structure, build_parsl_config
-        assert callable(relax_structure)
-        assert callable(build_parsl_config)
+        # scheduler.py is now a stub; row handles job submission via workflow.toml
+        import galoop.engine.scheduler  # must at least import cleanly
 
     def test_surface(self):
         from galoop.science.surface import (

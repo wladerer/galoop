@@ -20,7 +20,7 @@ setup(
         "dscribe>=1.2",
         "torch>=2.0",
         "mace-torch>=0.3",
-        "parsl>=2024.4",
+        "signac>=2.0",
         "pytest"
     ],
     extras_require={

@@ -7,8 +7,9 @@ Tests for the parsl-based scheduler: config building and app execution.
 from __future__ import annotations
 
 import pytest
-import parsl
-from parsl.config import Config
+
+parsl = pytest.importorskip("parsl", reason="parsl not installed; scheduler tests skipped")
+Config = pytest.importorskip("parsl.config", reason="parsl not installed").Config
 
 
 # ---------------------------------------------------------------------------

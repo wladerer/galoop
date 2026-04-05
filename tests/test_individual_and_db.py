@@ -75,7 +75,7 @@ class TestIndividual:
 class TestDatabase:
 
     def test_setup(self, temp_db):
-        assert temp_db.path.exists()
+        assert temp_db.workspace.exists()
 
     def test_insert_and_get(self, temp_db):
         ind = Individual.from_init(geometry_path="/tmp/t.vasp",
