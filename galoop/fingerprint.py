@@ -1,14 +1,13 @@
 """
 galoop/fingerprint.py
 
-Post-relaxation duplicate detection using graph isomorphism (primary) with
-SOAP Tanimoto as a fallback and display metric.
+Post-relaxation duplicate detection using SOAP Tanimoto similarity.
 
 Detection uses a multi-stage cascade:
-  1. Composition gate  (O(1))
-  2. Energy gate       (O(1))
-  3. Graph isomorphism (when n_slab_atoms is known and networkx is available)
-     OR distance-histogram cosine gate + SOAP Tanimoto (fallback)
+  1. Composition gate          (O(1))
+  2. Energy gate               (O(1))
+  3. Distance-histogram cosine (cheap pre-filter)
+  4. SOAP Tanimoto             (definitive)
 """
 
 from __future__ import annotations
@@ -35,7 +34,7 @@ class StructRecord:
     energy: float | None        # raw DFT energy; None if unavailable
     composition: str            # sorted formula: atoms.get_chemical_formula("metal")
     dist_hist: np.ndarray       # shape (n_bins,), L1-normalised
-    chem_envs: list | None = field(default=None)  # networkx graphs; None if unavailable
+    prerelax_soap: np.ndarray | None = field(default=None)  # POSCAR SOAP for pre-relax comparison
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +355,7 @@ def classify_postrelax(
     atoms: Atoms,
     energy: float | None,
     struct_cache: dict[str, StructRecord],
-    duplicate_threshold: float = 0.90,
+    duplicate_threshold: float = 0.95,
     energy_tol_pct: float = 5.0,
     dist_hist_threshold: float = 0.95,
     dist_hist_bins: int = 50,
@@ -370,30 +369,25 @@ def classify_postrelax(
     """
     Classify a relaxed structure as ``"duplicate"`` or ``"unique"``.
 
-    Uses a multi-stage cascade:
-      1. Composition gate
-      2. Energy gate
-      3. Graph isomorphism on adsorbate chemical environments (when
-         n_slab_atoms > 0 and networkx is available), OR distance-histogram
-         cosine gate + SOAP Tanimoto threshold (fallback)
-
-    The SOAP Tanimoto is always computed and returned for display purposes,
-    but it does not drive the duplicate decision when graph isomorphism is used.
+    Uses a multi-stage cascade (cheapest first):
+      1. Composition gate  (O(1))
+      2. Energy gate       (O(1))
+      3. Distance-histogram cosine pre-filter
+      4. SOAP Tanimoto     (definitive)
 
     Parameters
     ----------
     atoms : relaxed geometry (CONTCAR)
     energy : raw DFT energy; None if unavailable
     struct_cache : ``{struct_id: StructRecord}`` cache
-    duplicate_threshold : Tanimoto similarity cutoff (fallback only)
+    duplicate_threshold : SOAP Tanimoto cutoff for duplicate classification
     energy_tol_pct : max % energy difference relative to existing (0 = disabled)
-    dist_hist_threshold : min cosine similarity for distance histogram gate (fallback only)
+    dist_hist_threshold : min cosine similarity for distance histogram pre-filter
     dist_hist_bins : histogram bin count
     dist_hist_rmax : max distance for histogram (Å)
     r_cut, n_max, l_max, species : forwarded to :func:`compute_soap`
     n_slab_atoms : number of leading atoms belonging to the bare slab.
-        When > 0, graph isomorphism is used as the primary duplicate check,
-        preventing slab atoms from dominating the SOAP descriptor.
+        When > 0, SOAP is averaged over adsorbate positions only.
 
     Returns
     -------
@@ -405,14 +399,10 @@ def classify_postrelax(
     new_comp = _composition(atoms)
     new_soap = compute_soap(atoms, r_cut, n_max, l_max, species, n_slab_atoms=n_slab_atoms)
 
-    # Build graph fingerprint when slab size is known
-    new_chem_envs: list | None = None
-    if n_slab_atoms > 0:
-        new_chem_envs = build_chem_envs(atoms, n_slab_atoms)
-
     if not struct_cache:
         return "unique", None, new_soap
 
+    new_dhist = _dist_histogram(atoms, dist_hist_bins, dist_hist_rmax)
     best_sim, best_id = 0.0, None
 
     for rec in struct_cache.values():
@@ -422,31 +412,13 @@ def classify_postrelax(
         # Gate 2: energy
         if not _energy_gate_passes(energy, rec.energy, energy_tol_pct):
             continue
-
-        # Gate 3a: graph isomorphism (preferred)
-        if new_chem_envs is not None and rec.chem_envs is not None:
-            if _compare_chem_envs(new_chem_envs, rec.chem_envs):
-                # Confirmed duplicate by topology; record SOAP sim for display
-                sim = tanimoto_similarity(new_soap, rec.soap_vector)
-                if sim > best_sim:
-                    best_sim, best_id = sim, rec.id
-            # Graph said "different" — not a duplicate; skip SOAP fallback
-            continue
-
-        # Gate 3b: distance histogram cosine (SOAP fallback path)
-        new_dhist = _dist_histogram(atoms, dist_hist_bins, dist_hist_rmax)
+        # Gate 3: distance histogram cosine (cheap pre-filter)
         if _cosine(new_dhist, rec.dist_hist) < dist_hist_threshold:
             continue
-
-        # Gate 4: SOAP Tanimoto
+        # Gate 4: SOAP Tanimoto (definitive)
         sim = tanimoto_similarity(new_soap, rec.soap_vector)
         if sim > best_sim:
             best_sim, best_id = sim, rec.id
 
-    # For graph path: best_id is set only when graph iso confirmed a duplicate
-    if new_chem_envs is not None:
-        label = "duplicate" if best_id is not None else "unique"
-    else:
-        label = "duplicate" if best_sim >= duplicate_threshold else "unique"
-
+    label = "duplicate" if best_sim >= duplicate_threshold else "unique"
     return label, best_id, new_soap

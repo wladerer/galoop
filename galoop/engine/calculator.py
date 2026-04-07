@@ -120,6 +120,46 @@ class CalculatorStage:
 
     # -- MACE --------------------------------------------------------------
 
+    # Class-level cache for loaded MACE calculators (thread-safe reuse)
+    _mace_cache: dict[tuple, object] = {}
+    _mace_lock = None  # lazily initialised threading.Lock
+
+    @classmethod
+    def _get_mace_calc(cls, mace_model: str, mace_device: str, mace_dtype: str):
+        """Load a MACE calculator, reusing a cached instance if available.
+
+        torch.jit.load is not thread-safe, so a lock serialises the first
+        load.  Subsequent calls return a cached calculator.
+        """
+        import threading
+        if cls._mace_lock is None:
+            cls._mace_lock = threading.Lock()
+
+        key = (mace_model, mace_device, mace_dtype)
+        if key in cls._mace_cache:
+            return cls._mace_cache[key]
+
+        with cls._mace_lock:
+            # Double-check after acquiring lock
+            if key in cls._mace_cache:
+                return cls._mace_cache[key]
+
+            from pathlib import Path as _Path
+            model_path = _Path(mace_model)
+            if model_path.exists():
+                from mace.calculators import MACECalculator
+                calc = MACECalculator(
+                    model_paths=str(model_path),
+                    device=mace_device,
+                    default_dtype=mace_dtype,
+                )
+            else:
+                from mace.calculators import mace_mp
+                calc = mace_mp(model=mace_model, device=mace_device, default_dtype=mace_dtype)
+
+            cls._mace_cache[key] = calc
+            return calc
+
     def _run_mace(
         self,
         atoms: Atoms,
@@ -130,21 +170,8 @@ class CalculatorStage:
         fmax: float | None = None,
     ) -> StageResult:
         """Relax with a MACE calculator (foundation model or custom .pt file)."""
-        from pathlib import Path as _Path
         try:
-            model_path = _Path(mace_model)
-            if model_path.exists():
-                # Custom / fine-tuned model file → use MACECalculator directly
-                from mace.calculators import MACECalculator
-                calc = MACECalculator(
-                    model_paths=str(model_path),
-                    device=mace_device,
-                    default_dtype=mace_dtype,
-                )
-            else:
-                # Named foundation model ("small", "medium", "large", "medium-0b3", …)
-                from mace.calculators import mace_mp
-                calc = mace_mp(model=mace_model, device=mace_device, default_dtype=mace_dtype)
+            calc = self._get_mace_calc(mace_model, mace_device, mace_dtype)
         except ImportError as exc:
             raise ImportError(
                 "MACE requires mace-torch.  Install with: pip install mace-torch"

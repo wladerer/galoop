@@ -32,7 +32,7 @@ from galoop.individual import Individual, STATUS, OPERATOR
 from galoop.store import GaloopStore
 from galoop.fingerprint import (
     classify_postrelax, compute_soap, tanimoto_similarity,
-    StructRecord, _dist_histogram, _composition, build_chem_envs,
+    StructRecord, _dist_histogram, _composition,
 )
 from galoop.science.reproduce import (
     splice, merge, mutate_add, mutate_remove,
@@ -119,6 +119,7 @@ def run(
 
     best_gce = float("inf")
     stall_count = 0
+    prev_evals = total_evals  # track evals to detect new unique arrivals
     for ind in store.get_by_status(STATUS.CONVERGED):
         if ind.grand_canonical_energy is not None and ind.grand_canonical_energy < best_gce:
             best_gce = ind.grand_canonical_energy
@@ -252,12 +253,13 @@ def run(
                     n_slab_atoms=slab_info.n_slab_atoms,
                 )
 
-            # Stall tracking (once per poll cycle)
-            if done_ids and total_evals > 0:
+            # Stall tracking: only count when new unique evaluations arrive
+            if total_evals > prev_evals:
                 if best_gce < prev_best - 1e-6:
                     stall_count = 0
                 else:
-                    stall_count += 1
+                    stall_count += (total_evals - prev_evals)
+                prev_evals = total_evals
 
                 # Retrain GPR when new data arrives
                 if gpr is not None and done_ids:
@@ -381,6 +383,22 @@ def _handle_converged(
             ind = ind.with_energy(raw=raw_e, grand_canonical=gce)
             store.update(ind)
 
+            # Compute pre-relax SOAP from POSCAR for pre-relax duplicate comparison
+            prerelax_soap = None
+            poscar = struct_dir / "POSCAR"
+            if poscar.exists():
+                try:
+                    pre_atoms = read(str(poscar), format="vasp")
+                    prerelax_soap = compute_soap(
+                        pre_atoms,
+                        r_cut=config.fingerprint.r_cut,
+                        n_max=config.fingerprint.n_max,
+                        l_max=config.fingerprint.l_max,
+                        n_slab_atoms=n_slab_atoms,
+                    )
+                except Exception:
+                    pass
+
             record = StructRecord(
                 id=ind.id,
                 soap_vector=soap_vec,
@@ -391,7 +409,7 @@ def _handle_converged(
                     n_bins=config.fingerprint.dist_hist_bins,
                     r_max=config.fingerprint.r_cut,
                 ),
-                chem_envs=build_chem_envs(atoms, n_slab_atoms) if n_slab_atoms > 0 else None,
+                prerelax_soap=prerelax_soap,
             )
             struct_cache[ind.id] = record
 
@@ -442,6 +460,7 @@ def _build_initial_population(config, slab_info, store: GaloopStore, rng):
                         n_orientations=ads_cfg.n_orientations,
                         binding_index=ads_cfg.binding_index,
                         rng=rng,
+                        n_slab_atoms=slab_info.n_slab_atoms,
                     )
         except Exception as exc:
             log.warning("structure_%05d: placement failed (%s) — falling back", i, exc)
@@ -451,6 +470,7 @@ def _build_initial_population(config, slab_info, store: GaloopStore, rng):
             current = place_adsorbate(
                 current, ads_atoms[first],
                 slab_info.zmin, slab_info.zmax, rng=rng,
+                n_slab_atoms=slab_info.n_slab_atoms,
             )
 
         # Quick constrained pre-relax: let adsorbates settle toward surface
@@ -579,9 +599,13 @@ def _fill_workers(store: GaloopStore, config, slab_info, rng, total_evals,
             continue
         new_ind, child_atoms = result
 
-        # Pre-relaxation duplicate check: graph isomorphism on unrelaxed structure
-        if struct_cache and n_slab_atoms > 0:
-            if _is_prerelax_duplicate(child_atoms, struct_cache, n_slab_atoms):
+        # Pre-relaxation duplicate check: SOAP similarity on unrelaxed structure
+        if struct_cache:
+            if _is_prerelax_duplicate(child_atoms, struct_cache, n_slab_atoms,
+                                      threshold=config.fingerprint.prerelax_duplicate_threshold,
+                                      r_cut=config.fingerprint.r_cut,
+                                      n_max=config.fingerprint.n_max,
+                                      l_max=config.fingerprint.l_max):
                 log.debug("  %s: pre-relax duplicate — skipped", new_ind.id)
                 new_ind = new_ind.mark_duplicate()
                 new_ind.extra_data = {**new_ind.extra_data, "prerelax_dup": True}
@@ -684,6 +708,7 @@ def _spawn_one(store: GaloopStore, config, slab_info, rng,
                 n_orientations=ads_cfg.n_orientations,
                 binding_index=ads_cfg.binding_index,
                 rng=rng,
+                n_slab_atoms=slab_info.n_slab_atoms,
             )
         elif op == OPERATOR.MUTATE_REMOVE:
             result = mutate_remove(parent_atoms[0], slab_info.n_slab_atoms, rng=rng)
@@ -771,6 +796,7 @@ def _place_random(store: GaloopStore, config, slab_info, rng):
                 n_orientations=ads_cfg.n_orientations,
                 binding_index=ads_cfg.binding_index,
                 rng=rng,
+                n_slab_atoms=slab_info.n_slab_atoms,
             )
 
     ind = Individual.from_init(extra_data={"adsorbate_counts": dict(counts)})
@@ -813,6 +839,7 @@ def _spawn_gpr(gpr, store: GaloopStore, config, slab_info, rng):
                     n_orientations=ads_cfg.n_orientations,
                     binding_index=ads_cfg.binding_index,
                     rng=rng,
+                    n_slab_atoms=slab_info.n_slab_atoms,
                 )
     except Exception as exc:
         log.debug("GPR spawn placement failed: %s", exc)
@@ -863,6 +890,22 @@ def _rebuild_struct_cache(store: GaloopStore, struct_cache, config,
                 l_max=config.fingerprint.l_max,
                 n_slab_atoms=n_slab_atoms,
             )
+            # Pre-relax SOAP from POSCAR
+            prerelax_soap = None
+            poscar = struct_dir / "POSCAR"
+            if poscar.exists():
+                try:
+                    pre_atoms = read(str(poscar), format="vasp")
+                    prerelax_soap = compute_soap(
+                        pre_atoms,
+                        r_cut=config.fingerprint.r_cut,
+                        n_max=config.fingerprint.n_max,
+                        l_max=config.fingerprint.l_max,
+                        n_slab_atoms=n_slab_atoms,
+                    )
+                except Exception:
+                    pass
+
             struct_cache[ind.id] = StructRecord(
                 id=ind.id,
                 soap_vector=soap_vec,
@@ -873,7 +916,7 @@ def _rebuild_struct_cache(store: GaloopStore, struct_cache, config,
                     n_bins=config.fingerprint.dist_hist_bins,
                     r_max=config.fingerprint.r_cut,
                 ),
-                chem_envs=build_chem_envs(atoms, n_slab_atoms) if n_slab_atoms > 0 else None,
+                prerelax_soap=prerelax_soap,
             )
         except Exception as exc:
             log.debug("Could not rebuild cache for %s: %s", ind.id, exc)
@@ -883,26 +926,26 @@ def _is_prerelax_duplicate(
     atoms: Atoms,
     struct_cache: dict[str, StructRecord],
     n_slab_atoms: int,
+    threshold: float = 0.95,
+    r_cut: float = 6.0,
+    n_max: int = 8,
+    l_max: int = 6,
 ) -> bool:
-    """Check if *atoms* is topologically identical to any cached structure.
+    """Check if *atoms* is similar to any cached converged structure.
 
-    Uses composition gate + graph isomorphism only (no energy gate since
-    the structure hasn't been relaxed yet).  This is cheap enough to run
-    before submitting to Parsl.
+    Compares the candidate's SOAP against the cached pre-relax SOAP
+    (from POSCAR) for like-with-like comparison.  Falls back to the
+    post-relax SOAP if pre-relax is unavailable.
     """
-    from galoop.fingerprint import build_chem_envs, _compare_chem_envs, _composition
-
     new_comp = _composition(atoms)
-    new_envs = build_chem_envs(atoms, n_slab_atoms)
-    if new_envs is None:
-        return False
+    new_soap = compute_soap(atoms, r_cut=r_cut, n_max=n_max, l_max=l_max,
+                            n_slab_atoms=n_slab_atoms)
 
     for rec in struct_cache.values():
         if rec.composition != new_comp:
             continue
-        if rec.chem_envs is None:
-            continue
-        if _compare_chem_envs(new_envs, rec.chem_envs):
+        ref_soap = rec.prerelax_soap if rec.prerelax_soap is not None else rec.soap_vector
+        if tanimoto_similarity(new_soap, ref_soap) >= threshold:
             return True
 
     return False

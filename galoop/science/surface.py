@@ -307,6 +307,7 @@ def place_adsorbate(
     rng: np.random.Generator | None = None,
     clash_scale: float = 0.85,
     max_attempts: int = 50,
+    n_slab_atoms: int = 0,
 ) -> Atoms:
     """
     Place an adsorbate on the slab, preferring surface binding sites.
@@ -343,28 +344,39 @@ def place_adsorbate(
     cell = slab.get_cell()
     n_slab_before = len(slab)
 
-    # Identify surface binding sites (atop, bridge, hollow)
-    # Use the bare slab atom count — the first n_slab atoms are always slab
-    n_slab_bare = n_slab_before
-    # If slab already has adsorbates, count only slab atoms
-    # (n_slab_before includes previously placed adsorbates)
-    # We need the original slab atom count — infer from constraints
-    for c in slab.constraints:
-        if isinstance(c, FixAtoms):
-            # Slab atoms include fixed + free surface layer
-            # Use the max fixed index + the same count as a heuristic
-            max_fixed = max(c.index) + 1
-            # Rough: slab atoms = at least up to the highest fixed index
-            # but usually more (free surface layer above)
-            break
+    # Use the bare slab atom count for site identification and height reference.
+    # n_slab_atoms is the original slab size (excludes previously placed adsorbates).
+    n_slab_bare = n_slab_atoms if n_slab_atoms > 0 else n_slab_before
 
     sites = find_surface_sites(slab, n_slab_bare)
-    if sites:
+
+    # Sort sites so the most isolated ones (farthest from existing adsorbates)
+    # are tried first.  This spreads adsorbates across the surface.
+    if sites and len(slab) > n_slab_bare:
+        ads_xy = slab.get_positions()[n_slab_bare:, :2]
+        def _min_dist_to_existing(site_xy):
+            diffs = ads_xy - site_xy
+            # Minimum image in fractional coordinates for PBC
+            frac = np.linalg.solve(cell[:2, :2].T, diffs.T).T
+            frac -= np.round(frac)
+            cart = frac @ cell[:2, :2]
+            return np.min(np.linalg.norm(cart, axis=1))
+        sites.sort(key=_min_dist_to_existing, reverse=True)
+        # Add some randomness: shuffle within distance tiers so we don't
+        # always pick the exact same site
+        tier_size = max(3, len(sites) // 5)
+        for start in range(0, len(sites), tier_size):
+            end = min(start + tier_size, len(sites))
+            tier = sites[start:end]
+            rng.shuffle(tier)
+            sites[start:end] = tier
+    elif sites:
         rng.shuffle(sites)
 
     combined = slab.copy()  # initialise so the variable is always bound
 
-    # Binding height: place binding atom ~1.8-2.2 Å above slab top
+    # Binding height: place binding atom ~1.8-2.2 Å above the actual slab top
+    # (not above previously placed adsorbates)
     slab_top_z = slab.get_positions()[:n_slab_bare, 2].max()
     from ase.data import covalent_radii as _cov_rad
     binding_z_offset = 1.8  # reasonable default for most adsorbate-metal bonds
@@ -470,7 +482,7 @@ def detect_desorption(
                   Defaults to ``slab_info.zmax + 0.5``.
     """
     if z_threshold is None:
-        z_threshold = slab_info.zmax + 0.5
+        z_threshold = slab_info.zmax + 3.0
 
     if len(atoms) <= slab_info.n_slab_atoms:
         return False

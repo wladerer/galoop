@@ -100,7 +100,10 @@ class FingerprintConfig(BaseModel):
     r_cut: float = Field(default=6.0, gt=0.0)
     n_max: int = Field(default=8, ge=1)
     l_max: int = Field(default=6, ge=0)
-    duplicate_threshold: float = Field(default=0.90, gt=0.0, le=1.0)
+    duplicate_threshold: float = Field(default=0.95, gt=0.0, le=1.0,
+        description="SOAP Tanimoto cutoff for post-relax duplicate detection")
+    prerelax_duplicate_threshold: float = Field(default=0.95, gt=0.0, le=1.0,
+        description="SOAP Tanimoto cutoff for pre-relax duplicate detection (compares pre-relax vs pre-relax SOAP)")
     energy_tol_pct: float = Field(default=5.0, ge=0.0,
         description="Energy gate: max % difference relative to existing structure")
     dist_hist_bins: int = Field(default=50, ge=10,
