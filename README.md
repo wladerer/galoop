@@ -4,19 +4,26 @@ Galoop is my own pet project to extend GCGA algorithms. I am using Gaussian Proc
 
 ## CLI 
 
-Galoop comes with a set of cli commands since it is intended for use on terminal centered computing environments like HPCs
+Galoop comes with a set of cli commands since it is intended for use on terminal centered computing environments like HPCs. Some examples are
 
 `galoop status` - shows best candidates and progress of the campaign
 
 `galoop run` - starts the campaign 
 
-`galoop stop` - gracefully ends the campaign
+`galoop stop` - gracefully ends the campaign 
+
+The most commonly used command would be `galoop status` which gives the user a good idea of the success rate of relaxations, the frequency of various mutation operators, and the paths to the structures with the best (most negative) grand potential. 
 
 ## Input File
+
+`galoop` input files are validated as pydantic models to ensure that the program is not handed innapropriate input settings. 
+
+### User Notes
 
 galoop requires a yaml file with, at the minimum, the pristine surface and adsorbate geometries. The remaining input parameters have been tuned over countless GPR-GCGA campaigns. Furthermore, there is an optional calibration step that calculates the reference slab energy and chemical potentials for the adsorbates at the highest level of theory the user has chosen. 
 
 There are many parameters the user can change. But thankfully, there is no need for setting environment variables are corralling endless helper scripts or geometry reference files. I've included a sample input file to share the possible levers one has on the campaigns. I've annotated some of the more interesting features.
+
 
 ```yaml
 slab:
