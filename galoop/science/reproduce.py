@@ -238,10 +238,13 @@ def mutate_rattle_slab(
     amplitude: float = 0.1,
     rng: np.random.Generator | None = None,
 ) -> Atoms:
-    """Displace unfixed slab surface atoms by Gaussian noise.
+    """Rattle unfixed slab surface atoms AND adsorbates with Gaussian noise.
 
-    Only slab atoms not covered by a FixAtoms constraint are rattled.
-    Adsorbate atoms (indices >= n_slab) are untouched.
+    Slab atoms get a small amplitude (default 0.1 Å), adsorbates get a
+    larger one (3x the slab amplitude) so that the relaxation has a real
+    chance to find a different basin.  Adsorbate molecules are perturbed
+    as a whole (each molecule gets a single rigid translation) so molecular
+    geometry is preserved.
     """
     rng = rng or np.random.default_rng()
     child = atoms.copy()
@@ -252,9 +255,23 @@ def mutate_rattle_slab(
             fixed.update(int(i) for i in constraint.index)
 
     pos = child.get_positions()
+
+    # Slab atoms: small per-atom rattle
     for i in range(n_slab):
         if i not in fixed:
             pos[i] += rng.normal(0.0, amplitude, size=3)
+
+    # Adsorbates: rigid molecule rattle with larger amplitude
+    ads_amplitude = amplitude * 3
+    for mol in _group_molecules(atoms, n_slab):
+        delta = np.array([
+            rng.normal(0, ads_amplitude),
+            rng.normal(0, ads_amplitude),
+            rng.normal(0, ads_amplitude * 0.5),
+        ])
+        for idx in mol:
+            pos[idx] += delta
+
     child.set_positions(pos)
     return child
 
@@ -263,30 +280,57 @@ def mutate_displace(
     atoms: Atoms,
     n_slab: int,
     symbol: str | None = None,
-    displacement: float = 0.5,
+    displacement: float = 1.5,
     rng: np.random.Generator | None = None,
+    max_attempts: int = 10,
 ) -> Atoms | None:
-    """Randomly displace one adsorbate atom.  Returns ``None`` if no adsorbates."""
+    """Randomly displace one whole adsorbate molecule by a Gaussian step.
+
+    Operates on a connected molecule so molecular geometry is preserved.
+    Uses ``displacement`` directly as the sigma in x/y, with a smaller
+    sigma in z.  Tries up to *max_attempts* random displacements before
+    giving up.  Returns ``None`` if no clash-free displacement is found.
+    """
+    from galoop.science.surface import check_clash
+
     rng = rng or np.random.default_rng()
     if len(atoms) <= n_slab:
         return None
 
-    child = atoms.copy()
-    child.set_constraint(FixAtoms(indices=list(range(n_slab))))
+    all_molecules = _group_molecules(atoms, n_slab)
+    if not all_molecules:
+        return None
 
-    ads_indices = list(range(n_slab, len(atoms)))
+    eligible = all_molecules
     if symbol:
-        syms = child.get_chemical_symbols()
-        ads_indices = [i for i in ads_indices if syms[i] == symbol]
-        if not ads_indices:
+        syms = atoms.get_chemical_symbols()
+        eligible = [m for m in all_molecules if syms[m[0]] == symbol]
+        if not eligible:
             return None
 
-    idx = int(rng.choice(ads_indices))
-    delta = rng.normal(0, displacement / 3, size=3)
-    pos = child.get_positions()
-    pos[idx] += delta
-    child.set_positions(pos)
-    return child
+    mol = eligible[int(rng.integers(len(eligible)))]
+    n_mols = len(all_molecules)
+
+    for _ in range(max_attempts):
+        delta = np.array([
+            rng.normal(0, displacement),
+            rng.normal(0, displacement),
+            rng.normal(0, displacement * 0.3),
+        ])
+        child = atoms.copy()
+        child.set_constraint(FixAtoms(indices=list(range(n_slab))))
+        pos = child.get_positions()
+        for idx in mol:
+            pos[idx] += delta
+        child.set_positions(pos)
+
+        if check_clash(child, n_slab=n_slab, scale=0.7):
+            continue
+        if len(_group_molecules(child, n_slab)) != n_mols:
+            continue
+        return child
+
+    return None
 
 
 def mutate_translate(
@@ -294,32 +338,81 @@ def mutate_translate(
     n_slab: int,
     displacement: float = 0.8,
     rng: np.random.Generator | None = None,
+    max_attempts: int = 10,
 ) -> Atoms | None:
-    """Translate one entire adsorbate molecule as a rigid body.
+    """Translate one adsorbate molecule to a different surface site.
 
-    Picks a random connected molecule from the adsorbate layer and displaces
-    all its atoms by the same random vector (Gaussian, sigma=displacement in
-    x/y, sigma=displacement*0.3 in z).  Returns ``None`` if no adsorbates.
+    Picks a random connected molecule and moves it to a randomly chosen
+    surface site that is at least 2 Å from its current position.  This
+    produces a qualitatively different geometry rather than a small
+    perturbation (which always relaxes back to the same basin).
+
+    Tries up to *max_attempts* candidate sites to find one without clashes.
+    Falls back to a large Gaussian displacement if no clash-free site
+    is found or no surface sites are identified.
     """
+    from galoop.science.surface import check_clash
+
     rng = rng or np.random.default_rng()
     molecules = _group_molecules(atoms, n_slab)
     if not molecules:
         return None
 
     mol = molecules[int(rng.integers(len(molecules)))]
-    child = atoms.copy()
-    child.set_constraint(FixAtoms(indices=list(range(n_slab))))
+    other_mol_atoms = [i for m in molecules if m is not mol for i in m]
 
-    delta = np.array([
-        rng.normal(0, displacement),
-        rng.normal(0, displacement),
-        rng.normal(0, displacement * 0.3),
-    ])
-    pos = child.get_positions()
-    for idx in mol:
-        pos[idx] += delta
-    child.set_positions(pos)
-    return child
+    base_pos = atoms.get_positions()
+    current_xy = base_pos[mol][:, :2].mean(axis=0)
+
+    try:
+        from galoop.science.surface import find_surface_sites
+        sites = find_surface_sites(atoms, n_slab)
+    except Exception:
+        sites = []
+
+    def _build_child(delta):
+        child = atoms.copy()
+        child.set_constraint(FixAtoms(indices=list(range(n_slab))))
+        pos = child.get_positions()
+        for idx in mol:
+            pos[idx] += delta
+        child.set_positions(pos)
+        return child
+
+    if sites:
+        sites_arr = np.array(sites)
+        dists = np.linalg.norm(sites_arr - current_xy, axis=1)
+        far_sites = sites_arr[dists > 2.0]
+        if len(far_sites) == 0:
+            far_sites = sites_arr
+        rng.shuffle(far_sites)
+
+        for target_xy in far_sites[:max_attempts]:
+            jitter = rng.normal(0, 0.3, size=2)
+            delta_xy = (target_xy - current_xy) + jitter
+            delta = np.array([delta_xy[0], delta_xy[1], rng.normal(0, displacement * 0.3)])
+            trial = _build_child(delta)
+            # Reject if the translated molecule clashes with anything else
+            if not check_clash(trial, n_slab=n_slab, scale=0.7):
+                # Also reject if the molecule got merged with another (graph change)
+                new_mols = _group_molecules(trial, n_slab)
+                if len(new_mols) == len(molecules):
+                    return trial
+
+    # Fallback: large Gaussian displacement (no site-aware jump)
+    for _ in range(max_attempts):
+        delta = np.array([
+            rng.normal(0, displacement),
+            rng.normal(0, displacement),
+            rng.normal(0, displacement * 0.3),
+        ])
+        trial = _build_child(delta)
+        if not check_clash(trial, n_slab=n_slab, scale=0.7):
+            new_mols = _group_molecules(trial, n_slab)
+            if len(new_mols) == len(molecules):
+                return trial
+
+    return None
 
 
 # ---------------------------------------------------------------------------

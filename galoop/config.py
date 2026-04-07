@@ -135,7 +135,10 @@ class GAConfig(BaseModel):
     population_size: int = Field(default=20, ge=2)
     max_structures: int = Field(default=1000, ge=1)
     min_structures: int = Field(default=100, ge=1)
-    max_stall: int = Field(default=10, ge=1)
+    max_stall: int = Field(default=10, ge=1,
+        description="Terminate after this many unique evaluations without energy improvement")
+    max_spawn_stall: int = Field(default=20, ge=1,
+        description="Terminate after this many consecutive poll cycles where no novel structure can be spawned (diversity exhausted)")
     min_adsorbates: int = Field(default=1, ge=0)
     max_adsorbates: int = Field(default=8, ge=1)
     boltzmann_temperature: float = Field(

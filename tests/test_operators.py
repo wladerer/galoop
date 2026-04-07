@@ -324,8 +324,8 @@ class TestMutateDisplace:
             assert_slab_unchanged(pa, result, n_slab)
 
     @pytest.mark.parametrize("seed", range(N_SEEDS))
-    def test_exactly_one_atom_moved(self, seed, co_parents, cu100_slab):
-        """displace moves exactly one adsorbate atom."""
+    def test_one_molecule_moved_rigidly(self, seed, co_parents, cu100_slab):
+        """displace moves a whole molecule by the same vector."""
         pa, _ = co_parents
         n_slab = _n_slab(cu100_slab)
         rng = np.random.default_rng(seed)
@@ -334,9 +334,15 @@ class TestMutateDisplace:
             return
         pos_before = pa.get_positions()[n_slab:]
         pos_after = result.get_positions()[n_slab:]
-        diffs = np.linalg.norm(pos_after - pos_before, axis=1)
-        n_moved = int((diffs > 1e-10).sum())
-        assert n_moved == 1, f"Expected exactly 1 atom moved, got {n_moved}"
+        diffs = pos_after - pos_before
+        dist = np.linalg.norm(diffs, axis=1)
+        moved = np.where(dist > 1e-10)[0]
+        # At least one atom moved (the molecule)
+        assert len(moved) >= 1
+        # All moved atoms moved by the same vector (rigid translation)
+        if len(moved) > 1:
+            for i in moved[1:]:
+                np.testing.assert_allclose(diffs[i], diffs[moved[0]], atol=1e-10)
 
 
 # ---------------------------------------------------------------------------
@@ -410,18 +416,23 @@ class TestMutateTranslate:
 class TestMutateRattleSlab:
 
     @pytest.mark.parametrize("seed", range(N_SEEDS))
-    def test_adsorbates_unchanged(self, seed, co_parents, cu100_slab):
-        """Adsorbate atoms must not move."""
+    def test_molecules_translated_rigidly(self, seed, co_parents, cu100_slab):
+        """Adsorbate molecules are translated as rigid bodies (intramolecular
+        bonds preserved)."""
         pa, _ = co_parents
         n_slab = _n_slab(cu100_slab)
         rng = np.random.default_rng(seed)
         result = mutate_rattle_slab(pa, n_slab, rng=rng)
-        np.testing.assert_allclose(
-            pa.get_positions()[n_slab:],
-            result.get_positions()[n_slab:],
-            atol=1e-10,
-            err_msg="Adsorbate atoms were moved by rattle_slab",
-        )
+        # Each CO molecule's C-O bond length should be preserved
+        from galoop.science.reproduce import _group_molecules
+        for mol in _group_molecules(pa, n_slab):
+            d_before = np.linalg.norm(
+                pa.get_positions()[mol[0]] - pa.get_positions()[mol[1]]
+            )
+            d_after = np.linalg.norm(
+                result.get_positions()[mol[0]] - result.get_positions()[mol[1]]
+            )
+            assert abs(d_before - d_after) < 1e-10
 
     @pytest.mark.parametrize("seed", range(N_SEEDS))
     def test_same_atom_count(self, seed, co_parents, cu100_slab):

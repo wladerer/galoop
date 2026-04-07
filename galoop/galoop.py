@@ -119,6 +119,7 @@ def run(
 
     best_gce = float("inf")
     stall_count = 0
+    spawn_stall_count = 0  # consecutive poll cycles where _fill_workers couldn't spawn anything
     prev_evals = total_evals  # track evals to detect new unique arrivals
     for ind in store.get_by_status(STATUS.CONVERGED):
         if ind.grand_canonical_energy is not None and ind.grand_canonical_energy < best_gce:
@@ -266,7 +267,7 @@ def run(
                     _retrain_gpr(gpr, store)
 
             # Convergence check — stop spawning if stalled, drain active futures
-            if _should_stop(total_evals, stall_count, config):
+            if _should_stop(total_evals, stall_count, spawn_stall_count, config):
                 if not active_futures:
                     log.info("Convergence criteria met.")
                     break
@@ -276,16 +277,22 @@ def run(
                 pair_counts = {}
 
                 # Spawn offspring to fill worker pool
-                _fill_workers(
+                spawned = _fill_workers(
                     store, config, slab_info, rng, total_evals,
                     active_futures, relax_structure, stage_configs,
                     mace_model, slab_info.n_slab_atoms,
                     pair_counts, struct_cache, gpr,
                 )
+                # Track spawn exhaustion: workers are free but nothing novel can be generated
+                if not spawned and len(active_futures) < config.scheduler.nworkers:
+                    spawn_stall_count += 1
+                else:
+                    spawn_stall_count = 0
 
             log.info(
-                "Evals=%d  Best=%.4f eV  Stall=%d/%d  Active=%d",
+                "Evals=%d  Best=%.4f eV  Stall=%d/%d  SpawnStall=%d/%d  Active=%d",
                 total_evals, best_gce, stall_count, config.ga.max_stall,
+                spawn_stall_count, config.ga.max_spawn_stall,
                 len(active_futures),
             )
             time.sleep(POLL_INTERVAL)
@@ -566,11 +573,18 @@ def _fill_workers(store: GaloopStore, config, slab_info, rng, total_evals,
                   mace_model, n_slab_atoms,
                   pair_counts: dict | None = None,
                   struct_cache: dict | None = None,
-                  gpr=None):
-    """Spawn offspring until the worker pool is full, submit via Parsl."""
+                  gpr=None) -> bool:
+    """Spawn offspring until the worker pool is full, submit via Parsl.
+
+    Returns True if any worker slot was filled; False if spawn exhausted
+    (hit max attempts with all candidates rejected as pre-relax duplicates
+    or operator failures).
+    """
     limit = config.scheduler.nworkers
     max_attempts = limit * 5  # avoid infinite loop
     attempts = 0
+    submitted = 0
+    initial_active = len(active_futures)
 
     while len(active_futures) < limit:
         if total_evals >= config.ga.max_structures:
@@ -630,6 +644,9 @@ def _fill_workers(store: GaloopStore, config, slab_info, rng, total_evals,
             n_slab_atoms=n_slab_atoms,
         )
         active_futures[new_ind.id] = fut
+        submitted += 1
+
+    return submitted > 0
 
 
 def _spawn_one(store: GaloopStore, config, slab_info, rng,
@@ -995,11 +1012,15 @@ def _sample_operator(rng, config) -> str:
     return str(rng.choice(ops, p=probs))
 
 
-def _should_stop(total_evals, stall_count, config):
-    if total_evals < config.ga.min_structures:
-        return False
+def _should_stop(total_evals, stall_count, spawn_stall_count, config):
     if total_evals >= config.ga.max_structures:
         return True
+    # Spawn exhaustion: can't generate novel candidates anymore.
+    # This can fire before min_structures if the composition/geometry space is small.
+    if spawn_stall_count >= config.ga.max_spawn_stall:
+        return True
+    if total_evals < config.ga.min_structures:
+        return False
     return stall_count >= config.ga.max_stall
 
 
