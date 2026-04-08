@@ -26,15 +26,16 @@ log = logging.getLogger(__name__)
 def relax_structure(
     struct_dir: str,
     stage_configs: list[dict],
-    mace_model: str = "medium",
-    mace_device: str = "cpu",
-    mace_dtype: str = "float32",
     n_slab_atoms: int = 0,
 ) -> dict:
     """Run the calculator pipeline for one structure.
 
-    Executed on a Parsl worker.  Returns the pipeline result dict with
-    keys: converged, final_energy, stage_results, final_atoms.
+    Executed on a Parsl worker. ``stage_configs`` is a list of dicts (each
+    from :class:`StageConfig.model_dump`). Each carries its own ``params``
+    blob, so no backend-specific globals are threaded through.
+
+    For import-path backends (``type: pkg.mod:factory``), the module must
+    be importable on the worker's PYTHONPATH.
     """
     from pathlib import Path
 
@@ -46,14 +47,7 @@ def relax_structure(
     atoms = read_atoms(poscar, format="vasp")
 
     pipeline = build_pipeline(stage_configs)
-    return pipeline.run(
-        atoms,
-        struct_path,
-        mace_model=mace_model,
-        mace_device=mace_device,
-        mace_dtype=mace_dtype,
-        n_slab_atoms=n_slab_atoms,
-    )
+    return pipeline.run(atoms, struct_path, n_slab_atoms=n_slab_atoms)
 
 
 # ---------------------------------------------------------------------------

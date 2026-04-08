@@ -26,28 +26,50 @@ adsorbates:
     min_count: 0
     max_count: 3
 
-# Single MACE stage — swap in VASP stages for production DFT
+# Calculator stages. `type:` is either a built-in name (mace, vasp) or a
+# 'pkg.module:callable' import path to a user-defined factory that returns
+# an ASE Calculator. `params:` is passed straight through to the backend;
+# the keys depend on the backend (see galoop/engine/backends.py).
 calculator_stages:
   - name: relax
     type: mace
     fmax: 0.05
     max_steps: 300
     fix_slab_first: true     # pre-relax adsorbates with slab frozen
+    params:
+      model: small           # small | medium | large | path/to/custom.pt
+      device: cpu            # cpu | cuda | auto
+      dtype: float32         # float32 | float64
 
-# Example two-stage MACE → VASP workflow:
+# Example: two-stage MACE → VASP workflow
 #   - name: preopt
 #     type: mace
 #     fmax: 0.10
 #     max_steps: 200
+#     params: {model: small, device: cuda, dtype: float32}
 #   - name: dft
 #     type: vasp
 #     fmax: 0.05
 #     max_steps: 100
-#     incar: {ENCUT: 520, EDIFF: 1.0e-6, ISMEAR: 0, SIGMA: 0.05}
+#     params:
+#       incar: {ENCUT: 520, EDIFF: 1.0e-6, ISMEAR: 0, SIGMA: 0.05}
 
-mace_model: small            # small | medium | large | path/to/custom.pt
-mace_device: cpu             # cpu | cuda | auto
-mace_dtype: float32
+# Example: bring your own MLIP via a dotted import path
+#   - name: refine
+#     type: my_models.nrr:make_calculator
+#     fmax: 0.01
+#     max_steps: 500
+#     params:
+#       checkpoint: /abs/path/to/my_model.pt
+#       device: cuda
+
+# Optional: a separate (usually cheaper) calculator stage just for
+# snap_to_surface during initial-population building. If omitted, snap
+# uses the first calculator_stages entry with fmax/max_steps overridden.
+# snap_stage:
+#   name: snap
+#   type: mace
+#   params: {model: small, device: cpu, dtype: float32}
 
 scheduler:
   type: local                # local | slurm | pbs

@@ -1,14 +1,10 @@
 """Tests for ``galoop.spawn.snap_to_surface``.
 
-This used to instantiate a fresh MACE calculator on every call, which was a
-real performance bug *and* a source of stale-state shape mismatches under
-threading. After Phase 1 it routes through ``CalculatorStage._get_mace_calc``
-so the same instance is reused across calls. We test:
-
-- bare-slab early return (no adsorbates)
-- z-clamping clamps to the configured window even if BFGS fails
-- BFGS failures are logged, not silently swallowed
-- the cached MACE calc is fetched, not rebuilt, across calls
+snap_to_surface routes through :mod:`galoop.engine.backends` — whatever the
+resolved snap stage's ``type`` is, that backend's factory is called to
+build the ASE calculator used for the constrained pre-relax. Tests here
+monkeypatch the built-in ``mace`` registry entry with a fake factory so we
+don't need to load real MACE weights.
 """
 
 from __future__ import annotations
@@ -21,12 +17,11 @@ from ase.build import fcc111
 from ase.calculators.calculator import Calculator, all_changes
 
 from galoop import spawn
-from galoop.engine.calculator import CalculatorStage
+from galoop.engine import backends
 
 
 # ---------------------------------------------------------------------------
-# Stub MACE calculator that just zeros forces and returns a fake energy.
-# Lets us run snap_to_surface without loading the real MACE-MP weights.
+# Stub calculator that just zeros forces and returns a fake energy.
 # ---------------------------------------------------------------------------
 
 class _FakeMaceCalc(Calculator):
@@ -34,7 +29,6 @@ class _FakeMaceCalc(Calculator):
 
     def __init__(self):
         super().__init__()
-        # MACE's calculator instance has a `.results` dict — keep parity.
         self.results = {}
         self.call_count = 0
 
@@ -47,13 +41,27 @@ class _FakeMaceCalc(Calculator):
         self.results["forces"] = np.zeros((n, 3))
 
 
+def _make_fake_stage() -> SimpleNamespace:
+    """Pydantic-free shim that mimics StageConfig.model_dump()."""
+    return SimpleNamespace(
+        model_dump=lambda: {
+            "name": "preopt",
+            "type": "mace",
+            "fmax": 0.05,
+            "max_steps": 300,
+            "fix_slab_first": False,
+            "prescan_fmax": None,
+            "params": {"model": "medium", "device": "cpu", "dtype": "float32"},
+        },
+    )
+
+
 def _slab_config_pair():
     """Return (slab Atoms, fake config) ready for snap_to_surface."""
     slab = fcc111("Cu", size=(2, 2, 3), vacuum=10.0, periodic=True)
     cfg = SimpleNamespace(
-        mace_model="medium",
-        mace_device="cpu",
-        mace_dtype="float32",
+        calculator_stages=[_make_fake_stage()],
+        snap_stage=None,
         slab=SimpleNamespace(
             snap_z_min_offset=0.8,
             snap_z_max_offset=4.0,
@@ -61,6 +69,14 @@ def _slab_config_pair():
         ),
     )
     return slab, cfg
+
+
+def _install_fake_backend(monkeypatch, calc_factory):
+    """Swap the built-in ``mace`` backend with a user-supplied factory."""
+    monkeypatch.setitem(
+        backends._BUILTIN, "mace",
+        (lambda params: calc_factory(), False),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -71,15 +87,13 @@ class TestSnapToSurfaceBareSlab:
 
     def test_bare_slab_returns_unchanged(self, monkeypatch):
         slab, cfg = _slab_config_pair()
-        # Should NOT touch the calculator at all when there are no ads.
         called = []
-        monkeypatch.setattr(
-            CalculatorStage, "_get_mace_calc",
-            classmethod(lambda cls, *a, **k: called.append(1) or _FakeMaceCalc()),
+        _install_fake_backend(
+            monkeypatch,
+            lambda: (called.append(1), _FakeMaceCalc())[1],
         )
         result = spawn.snap_to_surface(slab, cfg, n_slab_atoms=len(slab))
         assert called == []  # never asked for the calc
-        # Same atoms returned (or a copy with same positions)
         assert (result.get_positions() == slab.get_positions()).all()
 
 
@@ -97,22 +111,16 @@ class TestSnapToSurfaceZClamp:
         return slab + ads, cfg, n_slab
 
     def test_low_adsorbate_clamped_up(self, monkeypatch):
-        atoms, cfg, n_slab = self._slab_with_ads(ads_z_offset=0.1)  # too low
-        monkeypatch.setattr(
-            CalculatorStage, "_get_mace_calc",
-            classmethod(lambda cls, *a, **k: _FakeMaceCalc()),
-        )
+        atoms, cfg, n_slab = self._slab_with_ads(ads_z_offset=0.1)
+        _install_fake_backend(monkeypatch, _FakeMaceCalc)
         result = spawn.snap_to_surface(atoms, cfg, n_slab_atoms=n_slab)
         top = atoms.positions[:n_slab, 2].max()
         ads_z_after = result.positions[n_slab, 2]
         assert ads_z_after >= top + cfg.slab.snap_z_min_offset - 1e-6
 
     def test_high_adsorbate_clamped_down(self, monkeypatch):
-        atoms, cfg, n_slab = self._slab_with_ads(ads_z_offset=10.0)  # way too high
-        monkeypatch.setattr(
-            CalculatorStage, "_get_mace_calc",
-            classmethod(lambda cls, *a, **k: _FakeMaceCalc()),
-        )
+        atoms, cfg, n_slab = self._slab_with_ads(ads_z_offset=10.0)
+        _install_fake_backend(monkeypatch, _FakeMaceCalc)
         result = spawn.snap_to_surface(atoms, cfg, n_slab_atoms=n_slab)
         top = atoms.positions[:n_slab, 2].max()
         ads_z_after = result.positions[n_slab, 2]
@@ -126,29 +134,21 @@ class TestSnapToSurfaceZClamp:
 class TestSnapToSurfaceBfgsFailure:
 
     def test_bfgs_failure_logged_and_clamps(self, monkeypatch, caplog):
-        atoms, cfg, n_slab = (
-            *_slab_config_pair(), 0,  # placeholder, replaced below
-        )
         slab, cfg = _slab_config_pair()
         n_slab = len(slab)
         top = slab.positions[:, 2].max()
         atoms = slab + Atoms("H", positions=[[0.0, 0.0, top + 2.0]])
 
         class _ExplodingCalc(_FakeMaceCalc):
-            def calculate(self, atoms=None, **kwargs):
+            def calculate(self, atoms=None, properties=None, system_changes=all_changes):
                 raise RuntimeError("intentional MACE failure")
 
-        monkeypatch.setattr(
-            CalculatorStage, "_get_mace_calc",
-            classmethod(lambda cls, *a, **k: _ExplodingCalc()),
-        )
+        _install_fake_backend(monkeypatch, _ExplodingCalc)
 
         with caplog.at_level("WARNING"):
             result = spawn.snap_to_surface(atoms, cfg, n_slab_atoms=n_slab)
 
-        # Must have logged a warning so the operator can spot CUDA OOM etc.
         assert any("snap_to_surface BFGS failed" in r.message for r in caplog.records)
-        # And still clamped the result so the caller gets usable geometry
         ads_z_after = result.positions[n_slab, 2]
         top = slab.positions[:, 2].max()
         assert (top + cfg.slab.snap_z_min_offset
@@ -157,39 +157,56 @@ class TestSnapToSurfaceBfgsFailure:
 
 
 # ---------------------------------------------------------------------------
-# Calculator caching
+# Backend dispatch: built-in vs import-path
 # ---------------------------------------------------------------------------
 
-class TestSnapUsesCachedCalc:
+# Module-level factory so it's importable via "tests.test_snap_to_surface:..."
+def _importable_fake_factory(params):
+    return _FakeMaceCalc()
 
-    def test_get_mace_calc_called_per_invocation_but_cache_intact(self, monkeypatch):
-        """snap_to_surface should call _get_mace_calc, but the underlying
-        cache shouldn't grow more than once for a fixed (model, device, dtype)."""
-        slab, cfg = _slab_config_pair()
+
+class TestSnapBackendDispatch:
+
+    def test_snap_respects_import_path_backend(self, monkeypatch):
+        """snap_to_surface with a 'pkg.mod:func' stage type should route
+        through importlib and call the user-supplied factory directly,
+        without touching the built-in mace registry entry."""
+        slab, _ = _slab_config_pair()
         n_slab = len(slab)
         top = slab.positions[:, 2].max()
+        atoms = slab + Atoms("H", positions=[[0.0, 0.0, top + 2.0]])
 
-        calls = []
-        original = CalculatorStage._get_mace_calc.__func__
+        # Poison the built-in 'mace' entry — if resolve() touches it, the
+        # test blows up loudly, proving dispatch went to the import path.
+        def _poisoned(_params):
+            raise AssertionError("built-in mace backend should not be called")
+        monkeypatch.setitem(backends._BUILTIN, "mace", (_poisoned, False))
 
-        def tracking_get(cls, model, device, dtype):
-            calls.append((model, device, dtype))
-            return _FakeMaceCalc()
-
-        monkeypatch.setattr(
-            CalculatorStage, "_get_mace_calc",
-            classmethod(tracking_get),
+        import_path_stage = SimpleNamespace(model_dump=lambda: {
+            "name": "snap",
+            "type": "tests.test_snap_to_surface:_importable_fake_factory",
+            "fmax": 0.2,
+            "max_steps": 30,
+            "fix_slab_first": False,
+            "prescan_fmax": None,
+            "params": {},
+        })
+        cfg = SimpleNamespace(
+            calculator_stages=[_make_fake_stage()],
+            snap_stage=import_path_stage,
+            slab=SimpleNamespace(
+                snap_z_min_offset=0.8,
+                snap_z_max_offset=4.0,
+                snap_timeout_s=120.0,
+            ),
         )
 
-        for _ in range(3):
-            atoms = slab + Atoms("H", positions=[[0.0, 0.0, top + 2.0]])
-            spawn.snap_to_surface(atoms, cfg, n_slab_atoms=n_slab)
-
-        # Calc-fetch is called every snap, but it's a cheap dict lookup in
-        # the real implementation. The point of the test is that the import
-        # path stays consolidated through CalculatorStage.
-        assert len(calls) == 3
-        assert all(c == ("medium", "cpu", "float32") for c in calls)
+        result = spawn.snap_to_surface(atoms, cfg, n_slab_atoms=n_slab)
+        top = slab.positions[:, 2].max()
+        ads_z_after = result.positions[n_slab, 2]
+        assert (top + cfg.slab.snap_z_min_offset
+                <= ads_z_after
+                <= top + cfg.slab.snap_z_max_offset)
 
 
 # ---------------------------------------------------------------------------
@@ -199,45 +216,39 @@ class TestSnapUsesCachedCalc:
 class TestSnapTimeout:
 
     def test_hung_bfgs_raises_snap_timeout_error(self, monkeypatch):
-        """A MACE calculator that wedges forever must be interrupted by
-        SIGALRM within the configured snap_timeout_s window."""
+        """A calculator that wedges forever must be interrupted by SIGALRM
+        within the configured snap_timeout_s window."""
         import time
 
         slab, cfg = _slab_config_pair()
-        cfg.slab.snap_timeout_s = 0.5  # tight — test must be fast
+        cfg.slab.snap_timeout_s = 0.5
         n_slab = len(slab)
         top = slab.positions[:, 2].max()
         atoms = slab + Atoms("H", positions=[[0.0, 0.0, top + 2.0]])
 
         class _HangingCalc(_FakeMaceCalc):
             def calculate(self, atoms=None, properties=None, system_changes=all_changes):
-                time.sleep(5.0)  # longer than snap_timeout_s
+                time.sleep(5.0)
 
-        monkeypatch.setattr(
-            CalculatorStage, "_get_mace_calc",
-            classmethod(lambda cls, *a, **k: _HangingCalc()),
-        )
+        _install_fake_backend(monkeypatch, _HangingCalc)
 
         import pytest
         t0 = time.monotonic()
         with pytest.raises(spawn.SnapTimeoutError):
             spawn.snap_to_surface(atoms, cfg, n_slab_atoms=n_slab)
         elapsed = time.monotonic() - t0
-        # Should fire well before the 5s sleep would have finished.
         assert elapsed < 2.0, f"timeout took {elapsed:.2f}s, expected < 2s"
 
     def test_build_initial_population_honors_galoopstop(self, monkeypatch, tmp_path):
         """Touching galoopstop mid-init-pop must stop before the next structure."""
         from galoop import spawn as spawn_mod
 
-        # Let the loop run a couple structures then trip the sentinel.
         run_dir = tmp_path / "run"
         run_dir.mkdir()
 
         call_count = {"n": 0}
-        real_snap = spawn_mod.snap_to_surface
 
-        def counting_snap(atoms, cfg, n_slab_atoms):
+        def counting_snap(atoms, cfg, n_slab_atoms, snap_stage=None):
             call_count["n"] += 1
             if call_count["n"] == 2:
                 (run_dir / "galoopstop").touch()
@@ -245,7 +256,6 @@ class TestSnapTimeout:
 
         monkeypatch.setattr(spawn_mod, "snap_to_surface", counting_snap)
 
-        # Minimal stub store with just what build_initial_population touches.
         class _StubStore:
             def __init__(self, run_dir):
                 self.run_dir = run_dir
@@ -260,8 +270,6 @@ class TestSnapTimeout:
             def update(self, ind):
                 pass
 
-        # Build a minimal config/slab_info pair that build_random_structure accepts.
-        # Rather than wiring all that, patch build_random_structure to a no-op.
         from ase.build import fcc111
         stub_slab = fcc111("Cu", size=(2, 2, 3), vacuum=10.0, periodic=True)
 
@@ -280,6 +288,8 @@ class TestSnapTimeout:
 
         cfg = SimpleNamespace(
             adsorbates=[SimpleNamespace(symbol="H")],
+            calculator_stages=[_make_fake_stage()],
+            snap_stage=None,
             ga=SimpleNamespace(
                 population_size=10,
                 min_adsorbates=1,
@@ -293,6 +303,5 @@ class TestSnapTimeout:
         import numpy as np
         spawn_mod.build_initial_population(cfg, slab_info, store, np.random.default_rng(0))
 
-        # Should have stopped after the 2nd structure; not all 10 built.
         assert call_count["n"] == 2
         assert len(store.inserted) < 10

@@ -60,6 +60,11 @@ def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None
 
     run_dir = store.run_dir
 
+    # Resolve the snap backend once, up front — users pay the model-load cost
+    # a single time regardless of population_size. Defaults to the first
+    # calculator stage's backend/params if config.snap_stage is unset.
+    snap_stage_cfg = _resolve_snap_stage(config)
+
     ads_atoms = load_ads_template_dict(config.adsorbates)
 
     # Stratified seeding: cycle target totals across [min_adsorbates, max_adsorbates]
@@ -98,7 +103,10 @@ def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None
         # BFGS call can't freeze the whole init-pop phase (see FINDINGS.md
         # cycle 4a).
         try:
-            current = snap_to_surface(current, config, slab_info.n_slab_atoms)
+            current = snap_to_surface(
+                current, config, slab_info.n_slab_atoms,
+                snap_stage=snap_stage_cfg,
+            )
         except SnapTimeoutError as exc:
             log.warning(
                 "structure_%05d: snap_to_surface timed out after %.1fs — skipping",
@@ -162,10 +170,31 @@ def _snap_timeout(timeout_s: float):
 # Snap-to-surface (cheap constrained pre-relax)
 # ---------------------------------------------------------------------------
 
+def _resolve_snap_stage(config) -> dict:
+    """Return a stage-config dict for snap_to_surface.
+
+    If ``config.snap_stage`` is set, use it. Otherwise default to the first
+    entry in ``config.calculator_stages`` with fmax/max_steps overridden to
+    the snap defaults (0.2 / 30). This lets users opt in to a cheaper
+    snap-time backend without forcing them to duplicate config.
+    """
+    if config.snap_stage is not None:
+        return config.snap_stage.model_dump()
+    first = config.calculator_stages[0]
+    d = first.model_dump()
+    d["fmax"] = 0.2
+    d["max_steps"] = 30
+    # Disable prescan for snap — snap itself IS the prescan.
+    d["fix_slab_first"] = False
+    d["prescan_fmax"] = None
+    return d
+
+
 def snap_to_surface(
     atoms: Atoms,
     config,
     n_slab_atoms: int,
+    snap_stage: dict | None = None,
 ) -> Atoms:
     """Quick constrained pre-relax to settle adsorbates toward the surface.
 
@@ -173,13 +202,15 @@ def snap_to_surface(
     binding positions. Then clamps adsorbate z-coordinates to a safe window
     (0.8–4.0 Å above slab top) to prevent burial or desorption.
 
-    Reuses the engine's MACE calculator cache rather than building a fresh
-    one per call (the duplication of MACE-loading logic was a bug source).
+    Routes through :mod:`galoop.engine.backends` so any registered backend
+    (MACE, fairchem, Orb, user's own MLIP via import path) can drive snap.
+    ``snap_stage`` is a resolved stage-config dict; if ``None``, it's
+    derived from ``config.snap_stage`` or the first calculator_stages entry.
     """
     from ase.constraints import FixAtoms
     from ase.optimize import BFGS
 
-    from galoop.engine.calculator import CalculatorStage
+    from galoop.engine import backends
 
     work = atoms.copy()
 
@@ -189,9 +220,11 @@ def snap_to_surface(
 
     import contextlib
 
-    calc = CalculatorStage._get_mace_calc(
-        config.mace_model, config.mace_device, config.mace_dtype,
-    )
+    if snap_stage is None:
+        snap_stage = _resolve_snap_stage(config)
+
+    factory, _drives = backends.resolve(snap_stage["type"])
+    calc = factory(dict(snap_stage.get("params", {})))
     # Drop any stale results from a prior atoms-of-different-size call.
     with contextlib.suppress(AttributeError):
         calc.results.clear()
@@ -250,7 +283,6 @@ def fill_workers(
     active_futures: dict,
     relax_fn: Callable,
     stage_configs: list[dict],
-    mace_model: str,
     n_slab_atoms: int,
     pair_counts: dict | None = None,
     struct_cache: dict | None = None,
@@ -323,9 +355,6 @@ def fill_workers(
 
         fut = relax_fn(
             str(struct_dir), stage_configs,
-            mace_model=mace_model,
-            mace_device=config.mace_device,
-            mace_dtype=config.mace_dtype,
             n_slab_atoms=n_slab_atoms,
         )
         active_futures[new_ind.id] = fut

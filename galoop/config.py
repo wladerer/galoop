@@ -144,25 +144,33 @@ class AdsorbateConfig(BaseModel):
 
 
 class StageConfig(BaseModel):
+    """Configuration for one calculator stage.
+
+    ``type`` is a pluggable backend identifier. Built-in names are ``mace``
+    and ``vasp``. To use a custom calculator, supply an import path of the
+    form ``pkg.module:factory_callable`` — ``factory_callable`` must take a
+    single ``params: dict`` argument and return an ASE ``Calculator``. See
+    ``galoop.engine.backends`` for details.
+
+    ``params`` is an opaque backend-specific dict passed straight through to
+    the factory. For the built-in ``mace`` backend that's
+    ``{model, device, dtype}``; for ``vasp`` it's ``{incar: {...}}``.
+    """
     name: str
-    type: str = Field(..., description="Calculator type: mace | vasp")
+    type: str = Field(..., description=(
+        "Calculator backend: 'mace', 'vasp', or a 'pkg.module:callable' "
+        "import path to a user-defined factory."
+    ))
     fmax: float = Field(default=0.05, gt=0.0)
     max_steps: int = Field(default=300, ge=1)
     energy_per_atom_tol: float = Field(default=10.0, gt=0.0)
     max_force_tol: float = Field(default=50.0, gt=0.0)
-    incar: dict[str, Any] = Field(default_factory=dict)
+    params: dict[str, Any] = Field(default_factory=dict,
+        description="Backend-specific parameters passed to the factory.")
     fix_slab_first: bool = Field(default=False,
         description="Pre-relax adsorbates with slab fully fixed before the main relax")
     prescan_fmax: float | None = Field(default=None, gt=0.0,
         description="Force cutoff for the prescan (defaults to fmax if unset)")
-
-    @field_validator("type")
-    @classmethod
-    def _normalise_type(cls, v: str) -> str:
-        v = v.lower()
-        if v not in ("mace", "vasp"):
-            raise ValueError(f"type must be 'mace' or 'vasp', got '{v}'")
-        return v
 
 
 class SchedulerConfig(BaseModel):
@@ -290,37 +298,20 @@ class GaloopConfig(BaseModel):
     slab: SlabConfig
     adsorbates: list[AdsorbateConfig] = Field(..., min_length=1)
     calculator_stages: list[StageConfig] = Field(..., min_length=1)
+    snap_stage: StageConfig | None = Field(
+        default=None,
+        description=(
+            "Optional calculator stage used by snap_to_surface during "
+            "initial-population building. If omitted, snap_to_surface uses "
+            "the first entry in calculator_stages with fmax/max_steps "
+            "overridden to 0.2 / 30. Override this if you want a cheaper "
+            "backend for init-pop than for the main pipeline."
+        ),
+    )
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
     ga: GAConfig = Field(default_factory=GAConfig)
     conditions: ConditionsConfig = Field(default_factory=ConditionsConfig)
     fingerprint: FingerprintConfig = Field(default_factory=FingerprintConfig)
-    mace_model: str = Field(
-        default="medium",
-        description=(
-            "MACE model identifier ('small', 'medium', 'large', 'medium-0b3', …) "
-            "or an absolute/relative path to a custom .pt model file."
-        ),
-    )
-    mace_device: str = Field(default="cpu")
-    mace_dtype: str = Field(
-        default="float32",
-        description="Floating-point dtype for MACE ('float32' or 'float64').",
-    )
-
-    @field_validator("mace_device")
-    @classmethod
-    def _valid_device(cls, v: str) -> str:
-        v = v.lower()
-        if v not in ("cpu", "cuda", "auto"):
-            raise ValueError(f"mace_device must be cpu/cuda/auto, got '{v}'")
-        return v
-
-    @field_validator("mace_dtype")
-    @classmethod
-    def _valid_dtype(cls, v: str) -> str:
-        if v not in ("float32", "float64"):
-            raise ValueError(f"mace_dtype must be float32 or float64, got '{v}'")
-        return v
 
     @model_validator(mode="after")
     def _unique_stage_names(self) -> GaloopConfig:
@@ -328,6 +319,28 @@ class GaloopConfig(BaseModel):
         if len(names) != len(set(names)):
             raise ValueError("Duplicate calculator stage names")
         return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_mace_fields(cls, data: Any) -> Any:
+        """Loud failure for pre-refactor top-level mace_model/device/dtype."""
+        if isinstance(data, dict):
+            legacy = [k for k in ("mace_model", "mace_device", "mace_dtype")
+                      if k in data]
+            if legacy:
+                raise ValueError(
+                    f"Top-level {legacy} are no longer supported. "
+                    "Move them into the params dict of each mace-type "
+                    "calculator stage, e.g.\n"
+                    "  calculator_stages:\n"
+                    "    - name: preopt\n"
+                    "      type: mace\n"
+                    "      params:\n"
+                    "        model: small\n"
+                    "        device: cuda\n"
+                    "        dtype: float32"
+                )
+        return data
 
 
 # ---------------------------------------------------------------------------

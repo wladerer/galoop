@@ -72,14 +72,7 @@ def _run_pipeline(atoms: Atoms, struct_dir: Path, config,
     write(str(struct_dir / "POSCAR"), atoms, format="vasp")
 
     pipeline = build_pipeline(config.calculator_stages)
-    result = pipeline.run(
-        atoms,
-        struct_dir,
-        mace_model=config.mace_model,
-        mace_device=config.mace_device,
-        mace_dtype=config.mace_dtype,
-        n_slab_atoms=n_slab_atoms,
-    )
+    result = pipeline.run(atoms, struct_dir, n_slab_atoms=n_slab_atoms)
 
     if not result["converged"] or math.isnan(float(result["final_energy"])):
         raise RuntimeError(

@@ -1,7 +1,10 @@
 """
 galoop/engine/calculator.py
 
-Multi-stage calculator pipeline: MACE-MP and/or VASP.
+Multi-stage calculator pipeline. Backends are pluggable via
+:mod:`galoop.engine.backends`: any ASE-compatible calculator can be used
+by naming a built-in (``mace``, ``vasp``) or an import path
+(``pkg.module:factory``) in the stage config.
 
 Each stage relaxes the geometry and writes a CONTCAR for the next stage.
 """
@@ -9,15 +12,15 @@ Each stage relaxes the geometry and writes a CONTCAR for the next stage.
 from __future__ import annotations
 
 import logging
-import threading
 from pathlib import Path
-from typing import ClassVar, NamedTuple
+from typing import NamedTuple
 
 import numpy as np
 from ase import Atoms
 from ase.io import write
 from ase.optimize import BFGS
 
+from galoop.engine import backends
 from galoop.science.surface import read_atoms
 
 log = logging.getLogger(__name__)
@@ -40,7 +43,14 @@ class StageResult(NamedTuple):
 # ---------------------------------------------------------------------------
 
 class CalculatorStage:
-    """One stage in the multi-stage relaxation pipeline."""
+    """One stage in the multi-stage relaxation pipeline.
+
+    Dispatch is handled by :mod:`galoop.engine.backends`: ``type`` is
+    resolved to a ``(factory, drives_own_relaxation)`` pair at stage-build
+    time. Factories whose calculator drives its own relaxation (e.g. VASP
+    via ``ibrion``/``nsw``) are called once per relax; the others use a
+    Python-side BFGS loop.
+    """
 
     def __init__(
         self,
@@ -50,28 +60,41 @@ class CalculatorStage:
         max_steps: int = 300,
         energy_per_atom_tol: float = 10.0,
         max_force_tol: float = 50.0,
-        incar: dict | None = None,
+        params: dict | None = None,
         fix_slab_first: bool = False,
         prescan_fmax: float | None = None,
         **extra,                         # absorb unknown keys from config
     ):
         self.name = name
-        self.calc_type = type.lower()
+        self.type = type
         self.fmax = fmax
         self.max_steps = max_steps
         self.energy_per_atom_tol = energy_per_atom_tol
         self.max_force_tol = max_force_tol
-        self.incar = incar or {}
+        self.params = dict(params or {})
         self.fix_slab_first = fix_slab_first
         self.prescan_fmax = prescan_fmax if prescan_fmax is not None else fmax
+
+        # Resolve the backend now so misconfigured yamls fail early, not on
+        # the first worker that tries to run this stage.
+        self._factory, self._drives_own_relaxation = backends.resolve(type)
+
+    def make_calculator(self, stage_dir: Path | None = None):
+        """Build an ASE calculator for this stage.
+
+        ``stage_dir`` is injected into ``params["directory"]`` for backends
+        that need a writable work dir (VASP). MACE and other pure-Python
+        calculators ignore it.
+        """
+        params = dict(self.params)
+        if stage_dir is not None:
+            params.setdefault("directory", str(stage_dir))
+        return self._factory(params)
 
     def run(
         self,
         atoms: Atoms,
         struct_dir: Path,
-        mace_model: str = "medium",
-        mace_device: str = "cpu",
-        mace_dtype: str = "float32",
         n_slab_atoms: int = 0,
     ) -> StageResult:
         """
@@ -92,14 +115,13 @@ class CalculatorStage:
             prescan_atoms = atoms.copy()
             prescan_atoms.set_constraint(FixAtoms(indices=list(range(n_slab_atoms))))
 
-            log.debug("Prescan (adsorbates-only) for %s in %s (fmax=%.4f)", self.name, prescan_dir, self.prescan_fmax)
+            log.debug("Prescan (adsorbates-only) for %s in %s (fmax=%.4f)",
+                      self.name, prescan_dir, self.prescan_fmax)
             try:
-                if self.calc_type == "mace":
-                    self._run_mace(prescan_atoms, prescan_dir, mace_model, mace_device, mace_dtype, fmax=self.prescan_fmax)
-                elif self.calc_type == "vasp":
-                    self._run_vasp(prescan_atoms, prescan_dir, fmax=self.prescan_fmax)
+                self._relax(prescan_atoms, prescan_dir, fmax=self.prescan_fmax)
             except Exception as exc:
-                log.warning("%s prescan failed (%s) — proceeding with original geometry", self.name, exc)
+                log.warning("%s prescan failed (%s) — proceeding with original geometry",
+                            self.name, exc)
             else:
                 prescan_contcar = prescan_dir / "CONTCAR"
                 if prescan_contcar.exists():
@@ -111,78 +133,50 @@ class CalculatorStage:
                         log.warning("Failed to load prescan CONTCAR: %s", exc)
 
         try:
-            if self.calc_type == "mace":
-                return self._run_mace(atoms, stage_dir, mace_model, mace_device, mace_dtype)
-            elif self.calc_type == "vasp":
-                return self._run_vasp(atoms, stage_dir)
-            else:
-                raise ValueError(f"Unknown calculator type: {self.calc_type}")
+            return self._relax(atoms, stage_dir)
         except Exception as exc:
             log.error("%s failed: %s", self.name, exc)
             return StageResult(False, float("nan"), 0, None)
 
-    # -- MACE --------------------------------------------------------------
+    # -- backend-agnostic relax driver -------------------------------------
 
-    # Class-level cache for loaded MACE calculators (thread-safe reuse).
-    # ClassVar so type checkers and ruff RUF012 understand the intent: this
-    # is shared state, not a per-instance default.
-    _mace_cache: ClassVar[dict[tuple, object]] = {}
-    _mace_lock: ClassVar[threading.Lock | None] = None
-
-    @classmethod
-    def _get_mace_calc(cls, mace_model: str, mace_device: str, mace_dtype: str):
-        """Load a MACE calculator, reusing a cached instance if available.
-
-        torch.jit.load is not thread-safe, so a lock serialises the first
-        load.  Subsequent calls return a cached calculator.
-        """
-        if cls._mace_lock is None:
-            cls._mace_lock = threading.Lock()
-        lock = cls._mace_lock  # local binding so the narrowing sticks
-
-        key = (mace_model, mace_device, mace_dtype)
-        if key in cls._mace_cache:
-            return cls._mace_cache[key]
-
-        with lock:
-            # Double-check after acquiring lock
-            if key in cls._mace_cache:
-                return cls._mace_cache[key]
-
-            from pathlib import Path as _Path
-            model_path = _Path(mace_model)
-            if model_path.exists():
-                from mace.calculators import MACECalculator
-                calc = MACECalculator(
-                    model_paths=str(model_path),
-                    device=mace_device,
-                    default_dtype=mace_dtype,
-                )
-            else:
-                from mace.calculators import mace_mp
-                calc = mace_mp(model=mace_model, device=mace_device, default_dtype=mace_dtype)
-
-            cls._mace_cache[key] = calc
-            return calc
-
-    def _run_mace(
+    def _relax(
         self,
         atoms: Atoms,
         stage_dir: Path,
-        mace_model: str,
-        mace_device: str,
-        mace_dtype: str = "float32",
         fmax: float | None = None,
     ) -> StageResult:
-        """Relax with a MACE calculator (foundation model or custom .pt file)."""
+        """One unified relax path.
+
+        Branches on ``self._drives_own_relaxation``:
+
+        - **False (MLIP-style)**: attach the calculator and run a Python BFGS
+          loop, writing a trajectory file. Works for MACE, fairchem, Orb,
+          SevenNet, anything with an ASE Calculator interface.
+        - **True (VASP-style)**: the calculator relaxes internally; we just
+          call ``get_potential_energy()`` and read the post-run CONTCAR.
+        """
         try:
-            calc = self._get_mace_calc(mace_model, mace_device, mace_dtype)
+            calc = self.make_calculator(stage_dir=stage_dir)
         except ImportError as exc:
             raise ImportError(
-                "MACE requires mace-torch.  Install with: pip install mace-torch"
+                f"Backend {self.type!r} could not be loaded: {exc}"
             ) from exc
+
+        if self._drives_own_relaxation:
+            return self._run_with_internal_relax(atoms, stage_dir, calc)
+        return self._run_with_bfgs(atoms, stage_dir, calc, fmax=fmax)
+
+    def _run_with_bfgs(
+        self,
+        atoms: Atoms,
+        stage_dir: Path,
+        calc,
+        fmax: float | None,
+    ) -> StageResult:
+        """BFGS loop for calculators that only provide energy+forces."""
         atoms = atoms.copy()
-        # Cached MACE calculator retains stale results from prior atoms of a
+        # Cached calculators retain stale results from prior atoms of a
         # different size — clear before reuse to avoid shape-mismatch errors.
         import contextlib
         with contextlib.suppress(AttributeError):
@@ -191,32 +185,24 @@ class CalculatorStage:
 
         traj_path = stage_dir / "trajectory.traj"
         log_path = stage_dir / "relax.log"
-        dyn = BFGS(
-            atoms,
-            trajectory=str(traj_path),
-            logfile=str(log_path),
-        )
+        dyn = BFGS(atoms, trajectory=str(traj_path), logfile=str(log_path))
 
         try:
-            converged = dyn.run(fmax=fmax if fmax is not None else self.fmax, steps=self.max_steps)
+            converged = dyn.run(
+                fmax=fmax if fmax is not None else self.fmax,
+                steps=self.max_steps,
+            )
         except Exception as exc:
-            log.warning("MACE relax failed: %s", exc)
+            log.warning("%s BFGS relax failed: %s", self.name, exc)
             converged = False
 
         energy = float(atoms.get_potential_energy())
         n_steps = getattr(dyn, "nsteps", 0)
 
-        # Sanity check: unreasonable energy per atom → treat as failed
-        epa = abs(energy) / max(len(atoms), 1)
-        if epa > self.energy_per_atom_tol:
-            log.warning(
-                "%s energy/atom = %.2f eV — exceeds tolerance %.1f",
-                self.name, epa, self.energy_per_atom_tol,
-            )
+        if not self._energy_sane(energy, atoms):
             converged = False
 
         self._write_contcar(atoms, stage_dir)
-
         return StageResult(
             converged=converged,
             energy=energy,
@@ -224,34 +210,22 @@ class CalculatorStage:
             trajectory_file=str(traj_path),
         )
 
-    # -- VASP --------------------------------------------------------------
-
-    def _run_vasp(self, atoms: Atoms, stage_dir: Path, fmax: float | None = None) -> StageResult:
-        """Relax with VASP via ASE's Vasp calculator."""
-        from ase.calculators.vasp import Vasp
-
-        # ASE's Vasp calculator expects **lowercase** keyword arguments.
-        # The user-facing config may use uppercase INCAR keys, so we lower-case them.
-        vasp_kwargs: dict[str, object] = {
-            "ismear": 0,
-            "sigma": 0.05,
-            "algo": "Fast",
-            "lreal": "Auto",
-            "lwave": False,
-            "lcharg": False,
-            "ibrion": 2,
-            "nsw": self.max_steps,
-            "ediffg": -(fmax if fmax is not None else self.fmax),
-            "ediff": 1e-5,
-        }
-        for key, val in self.incar.items():
-            vasp_kwargs[key.lower()] = val
-
-        try:
-            calc = Vasp(directory=str(stage_dir), **vasp_kwargs)
-        except Exception as exc:
-            log.warning("VASP init failed: %s", exc)
-            return StageResult(False, float("nan"), 0, None)
+    def _run_with_internal_relax(
+        self,
+        atoms: Atoms,
+        stage_dir: Path,
+        calc,
+    ) -> StageResult:
+        """For calculators that relax inside get_potential_energy() (VASP)."""
+        # CalculatorStage-level fmax/max_steps override whatever the factory
+        # baked in, so users get consistent knobs across backends. Only
+        # calculators exposing ASE's ``.set()`` API (Vasp does) are updated.
+        if hasattr(calc, "set"):
+            try:
+                calc.set(nsw=self.max_steps, ediffg=-self.fmax)
+            except Exception as exc:
+                log.debug("Could not override nsw/ediffg on %s: %s",
+                          type(calc).__name__, exc)
 
         atoms = atoms.copy()
         atoms.calc = calc
@@ -260,26 +234,41 @@ class CalculatorStage:
             energy = float(atoms.get_potential_energy())
             converged = True
         except Exception as exc:
-            log.warning("VASP run failed: %s", exc)
+            log.warning("%s internal relax failed: %s", self.name, exc)
             energy = float("nan")
             converged = False
 
-        # Read VASP-optimised geometry
+        # Prefer the backend's own output geometry if present.
         contcar = stage_dir / "CONTCAR"
         if contcar.exists():
             try:
                 atoms = read_atoms(contcar, format="vasp")
             except Exception as exc:
-                log.warning("Failed to read VASP CONTCAR: %s", exc)
+                log.warning("Failed to read stage CONTCAR: %s", exc)
 
+        if converged and not self._energy_sane(energy, atoms):
+            converged = False
+
+        self._write_contcar(atoms, stage_dir)
         return StageResult(
             converged=converged,
             energy=energy,
-            n_steps=0,   # would need OUTCAR parsing for exact count
+            n_steps=0,
             trajectory_file=None,
         )
 
     # -- helpers -----------------------------------------------------------
+
+    def _energy_sane(self, energy: float, atoms: Atoms) -> bool:
+        """Sanity check: unreasonable energy per atom → treat as failed."""
+        epa = abs(energy) / max(len(atoms), 1)
+        if epa > self.energy_per_atom_tol:
+            log.warning(
+                "%s energy/atom = %.2f eV — exceeds tolerance %.1f",
+                self.name, epa, self.energy_per_atom_tol,
+            )
+            return False
+        return True
 
     @staticmethod
     def _write_contcar(atoms: Atoms, stage_dir: Path) -> None:
@@ -305,9 +294,6 @@ class Pipeline:
         self,
         atoms: Atoms,
         struct_dir: Path,
-        mace_model: str = "medium",
-        mace_device: str = "cpu",
-        mace_dtype: str = "float32",
         n_slab_atoms: int = 0,
     ) -> dict:
         """
@@ -329,11 +315,7 @@ class Pipeline:
         all_converged = True
 
         for stage in self.stages:
-            result = stage.run(
-                current_atoms, struct_dir,
-                mace_model=mace_model, mace_device=mace_device, mace_dtype=mace_dtype,
-                n_slab_atoms=n_slab_atoms,
-            )
+            result = stage.run(current_atoms, struct_dir, n_slab_atoms=n_slab_atoms)
             stage_results[stage.name] = result
 
             if not result.converged:

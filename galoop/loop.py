@@ -85,12 +85,6 @@ def run(
             "Either set them in the config or let calibrate() compute them."
         )
 
-    # Resolve MACE model path relative to run_dir
-    mace_model = config.mace_model
-    _candidate = run_dir / mace_model
-    if _candidate.exists():
-        mace_model = str(_candidate)
-
     stage_configs = [s.model_dump() for s in config.calculator_stages]
 
     # Build initial population on first run
@@ -130,8 +124,8 @@ def run(
     active_futures: dict[str, Any] = {}
 
     # Crash recovery: handle structures orphaned by a previous crash
-    _recover_orphans(store, active_futures, stage_configs, config,
-                     mace_model, slab_info, relax_structure)
+    _recover_orphans(store, active_futures, stage_configs,
+                     slab_info, relax_structure)
 
     log.info(
         "Start: evals=%d  best=%.4f eV  active=%d",
@@ -241,7 +235,7 @@ def run(
                 spawned = fill_workers(
                     store, config, slab_info, rng, total_evals,
                     active_futures, relax_structure, stage_configs,
-                    mace_model, slab_info.n_slab_atoms,
+                    slab_info.n_slab_atoms,
                     pair_counts, struct_cache, gpr,
                 )
                 if not spawned and len(active_futures) < config.scheduler.nworkers:
@@ -286,8 +280,8 @@ def run(
 # Crash recovery
 # ---------------------------------------------------------------------------
 
-def _recover_orphans(store, active_futures, stage_configs, config,
-                     mace_model, slab_info, relax_fn) -> None:
+def _recover_orphans(store, active_futures, stage_configs,
+                     slab_info, relax_fn) -> None:
     """Submit any pending/orphaned structures with geometry on disk.
 
     Two cases handled here:
@@ -321,9 +315,6 @@ def _recover_orphans(store, active_futures, stage_configs, config,
         if contcar.exists() or poscar.exists():
             fut = relax_fn(
                 str(struct_dir), stage_configs,
-                mace_model=mace_model,
-                mace_device=config.mace_device,
-                mace_dtype=config.mace_dtype,
                 n_slab_atoms=slab_info.n_slab_atoms,
             )
             active_futures[ind.id] = fut

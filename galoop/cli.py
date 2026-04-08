@@ -380,9 +380,6 @@ def sample(config: str, output: str, n_structures: int, relax: bool,
             try:
                 result = pipeline.run(
                     current, tmp_dir,
-                    mace_model=cfg.mace_model,
-                    mace_device=cfg.mace_device,
-                    mace_dtype=cfg.mace_dtype,
                     n_slab_atoms=slab_info.n_slab_atoms,
                 )
             except Exception as exc:
@@ -563,6 +560,278 @@ def stop(run_dir: str):
     stop_file = Path(run_dir) / "galoopstop"
     stop_file.touch()
     click.echo(f"Stop requested: {stop_file}")
+
+
+# ---------------------------------------------------------------------------
+# init — scaffold a new campaign directory
+# ---------------------------------------------------------------------------
+
+_MINIMAL_YAML_TEMPLATE = """\
+# Minimal galoop campaign config. Edit the placeholders below (<LIKE THIS>)
+# before launching. Full schema reference: docs/example.yaml and README.md.
+
+slab:
+  geometry: {slab_path}
+  sampling_zmin: <TOP_Z + 0.5>   # lower bound of adsorbate placement window (Å)
+  sampling_zmax: <TOP_Z + 3.5>   # upper bound (Å)
+
+adsorbates:
+  # Mono-atomic example — for polyatomics add binding_index + coordinates.
+  - symbol: H
+    min_count: 0
+    max_count: 4
+
+calculator_stages:
+  - name: preopt
+    type: {backend_type}
+    fmax: 0.05
+    max_steps: 300
+    fix_slab_first: true
+    prescan_fmax: 0.10
+{backend_params}
+
+scheduler:
+  type: local                    # local | slurm | pbs
+  nworkers: 2
+
+ga:
+  population_size: 20
+  min_structures: 40
+  max_structures: 500
+  max_stall: 20
+  min_adsorbates: 1
+  max_adsorbates: 4
+
+conditions:
+  potential: 0.0                 # V vs RHE
+  pH: 0.0
+  temperature: 298.15
+
+fingerprint:
+  r_cut: 5.0
+  n_max: 6
+  l_max: 4
+  duplicate_threshold: 0.92
+"""
+
+_MACE_PARAMS_BLOCK = """\
+    params:
+      model: small               # small | medium | large | path/to/custom.pt
+      device: cuda               # cpu | cuda | auto
+      dtype: float32
+"""
+
+_CUSTOM_PARAMS_BLOCK = """\
+    params:
+      # Passed straight to your factory in calc.py.
+      # Add whatever keys your factory reads — checkpoint, device, task, …
+      device: cuda
+"""
+
+_CALC_TEMPLATE = '''\
+"""
+calc.py — user-space factory for a custom calculator backend.
+
+Reference this from galoop.yaml as:
+
+    calculator_stages:
+      - name: refine
+        type: calc:make_calculator
+        fmax: 0.03
+        max_steps: 300
+        params:
+          # whatever keys make_calculator reads
+          device: cuda
+
+As long as the directory containing calc.py is on PYTHONPATH (e.g. launch
+galoop from this directory, or set PYTHONPATH=.), galoop will import and
+call this factory once per stage build.
+
+The factory must return any ASE-compatible Calculator. If your calculator
+drives its own internal relaxation (VASP-style), return the tuple
+    (make_calculator, True)
+at module level instead, and galoop will call get_potential_energy() once
+rather than running BFGS on the Python side.
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import Any
+
+# Process-local cache so repeated stage builds (e.g. by Parsl workers)
+# reuse the loaded model. Keyed on whatever params distinguish one
+# instance from another.
+_CACHE: dict[tuple, Any] = {}
+_LOCK = threading.Lock()
+
+
+def _cache_key(params: dict) -> tuple:
+    return (
+        params.get("model", "default"),
+        params.get("device", "cpu"),
+    )
+
+
+def make_calculator(params: dict):
+    """Return an ASE Calculator configured from *params*.
+
+    Replace the body of this function with real model loading code. The
+    example below is a placeholder that deliberately raises so you don't
+    accidentally launch a campaign against a no-op calculator.
+    """
+    key = _cache_key(params)
+    if key in _CACHE:
+        return _CACHE[key]
+
+    with _LOCK:
+        if key in _CACHE:
+            return _CACHE[key]
+
+        # ------------------------------------------------------------
+        # Example: fairchem UMA (Meta FAIR, OMat24 + OC20 + more)
+        #
+        #   pip install fairchem-core
+        #
+        # from fairchem.core import pretrained_mlip
+        # from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
+        # predictor = pretrained_mlip.get_predict_unit(
+        #     params.get("model", "uma-s-1p1"),
+        #     device=params.get("device", "cuda"),
+        # )
+        # calc = FAIRChemCalculator(predictor, task_name=params.get("task", "oc20"))
+        # ------------------------------------------------------------
+        # Example: Orb-v3 (OMat24 checkpoint)
+        #
+        #   pip install orb-models
+        #
+        # from orb_models.forcefield import pretrained
+        # from orb_models.forcefield.calculator import ORBCalculator
+        # device = params.get("device", "cuda")
+        # orbff = pretrained.orb_v3_direct_20_omat(device=device)
+        # calc = ORBCalculator(orbff, device=device)
+        # ------------------------------------------------------------
+
+        raise NotImplementedError(
+            "calc.py:make_calculator is a placeholder. Edit it to return "
+            "a real ASE Calculator before launching a campaign."
+        )
+
+        _CACHE[key] = calc
+        return calc
+'''
+
+
+@cli.command()
+@click.argument("target_dir", type=click.Path(), default=".")
+@click.option("--slab", "-s", type=click.Path(exists=True), default=None,
+              help="Path to an existing slab geometry file (POSCAR/CIF/xyz). "
+                   "Will be copied into TARGET_DIR as slab.vasp if it's not "
+                   "already there.")
+@click.option("--backend", "-b",
+              type=click.Choice(["mace", "vasp", "custom"], case_sensitive=False),
+              default="mace",
+              help="Which calculator backend to scaffold. 'custom' pairs with "
+                   "--calc-template to generate a calc.py you fill in.")
+@click.option("--calc-template", is_flag=True,
+              help="Also write a calc.py factory template alongside the yaml.")
+@click.option("--force", is_flag=True,
+              help="Overwrite galoop.yaml / calc.py if they already exist.")
+def init(target_dir: str, slab: str | None, backend: str,
+         calc_template: bool, force: bool):
+    """Scaffold a new galoop campaign in TARGET_DIR.
+
+    Writes a minimal galoop.yaml with placeholder values you edit before
+    launching. Pass --slab to link an existing geometry file, and
+    --calc-template to generate a calc.py factory for a custom MLIP.
+
+    Examples
+    --------
+    galoop init runs/pt_nrr -s my_slab.vasp
+    galoop init runs/uma_test -s slab.vasp -b custom --calc-template
+    """
+    import shutil
+
+    target = Path(target_dir).resolve()
+    target.mkdir(parents=True, exist_ok=True)
+
+    # --- slab geometry ---------------------------------------------------
+    if slab is not None:
+        slab_src = Path(slab).resolve()
+        slab_dst = target / "slab.vasp"
+        if slab_src != slab_dst:
+            if slab_dst.exists() and not force:
+                click.echo(
+                    f"error: {slab_dst} already exists (use --force to overwrite)",
+                    err=True,
+                )
+                sys.exit(1)
+            shutil.copy(slab_src, slab_dst)
+            click.echo(f"copied {slab_src} -> {slab_dst}")
+        slab_path_for_yaml = str(slab_dst)
+    else:
+        slab_path_for_yaml = "<PATH_TO_YOUR_SLAB_FILE>"
+        click.echo(
+            "warning: no --slab provided; you must edit slab.geometry "
+            "before running `galoop run`",
+            err=True,
+        )
+
+    # --- backend params block -------------------------------------------
+    backend_lower = backend.lower()
+    if backend_lower == "mace":
+        backend_type = "mace"
+        backend_params = _MACE_PARAMS_BLOCK.rstrip()
+    elif backend_lower == "vasp":
+        backend_type = "vasp"
+        backend_params = (
+            "    params:\n"
+            "      incar:\n"
+            "        ENCUT: 520\n"
+            "        EDIFF: 1.0e-6\n"
+            "        ISMEAR: 0\n"
+            "        SIGMA: 0.05"
+        )
+    else:  # custom
+        backend_type = "calc:make_calculator"
+        backend_params = _CUSTOM_PARAMS_BLOCK.rstrip()
+
+    yaml_text = _MINIMAL_YAML_TEMPLATE.format(
+        slab_path=slab_path_for_yaml,
+        backend_type=backend_type,
+        backend_params=backend_params,
+    )
+
+    # --- write galoop.yaml -----------------------------------------------
+    yaml_path = target / "galoop.yaml"
+    if yaml_path.exists() and not force:
+        click.echo(
+            f"error: {yaml_path} already exists (use --force to overwrite)",
+            err=True,
+        )
+        sys.exit(1)
+    yaml_path.write_text(yaml_text)
+    click.echo(f"wrote {yaml_path}")
+
+    # --- optionally write calc.py ---------------------------------------
+    if calc_template or backend_lower == "custom":
+        calc_path = target / "calc.py"
+        if calc_path.exists() and not force:
+            click.echo(
+                f"error: {calc_path} already exists (use --force to overwrite)",
+                err=True,
+            )
+            sys.exit(1)
+        calc_path.write_text(_CALC_TEMPLATE)
+        click.echo(f"wrote {calc_path}")
+        if backend_lower == "custom":
+            click.echo(
+                "\nNote: calc.py contains a placeholder that raises on use. "
+                "Edit make_calculator() before launching, and make sure the "
+                "directory is on PYTHONPATH when you run galoop."
+            )
+
+    click.echo(f"\nNext steps:\n  1. edit {yaml_path}\n  2. galoop run -c {yaml_path} -d {target} -v")
 
 
 if __name__ == "__main__":
