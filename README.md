@@ -1,6 +1,6 @@
 # galoop
 
-Galoop is my own pet project to extend GCGA algorithms. I am using Gaussian Process Regression to guide GCGA towards a global minimum within composition space. The genetic algorithm acts to promote structural diversity while GPR steers the evolution. This method seems to help accelerate the compositional search and find when a surface is truly saturated under particular experimental conditions. A side effect of this is skipping over shallow basins in which local minima exist, perhaps skewing ensemble averaged results one might hope to glean from a GCGA campaign.  
+Galoop is my own pet project to extend GCGA algorithm implemented in GOCIA by Z. Zhang. I am using Gaussian Process Regression to guide GCGA towards a global minimum within composition space. The genetic algorithm acts to promote structural diversity while GPR steers the evolution. This method seems to help accelerate the compositional search and find when a surface is truly saturated under particular experimental conditions. A side effect of this is skipping over shallow basins in which local minima exist, perhaps skewing ensemble averaged results one might hope to glean from a GCGA campaign.  
 
 ## CLI 
 
