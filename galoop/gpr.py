@@ -58,14 +58,14 @@ class CompositionGPR:
         unique composition (best structure per stoichiometry).
         """
         from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
+        from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
 
         if len(compositions) < 2:
             return
 
         # Deduplicate: best energy per composition
         comp_best: dict[tuple, float] = {}
-        for counts, energy in zip(compositions, energies):
+        for counts, energy in zip(compositions, energies, strict=True):
             key = tuple(counts.get(s, 0) for s in self.species)
             if key not in comp_best or energy < comp_best[key]:
                 comp_best[key] = energy

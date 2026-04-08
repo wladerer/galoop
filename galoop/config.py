@@ -11,7 +11,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-
 # ---------------------------------------------------------------------------
 # Sub-configs
 # ---------------------------------------------------------------------------
@@ -22,11 +21,32 @@ class SlabConfig(BaseModel):
         description="DFT energy of bare slab (eV). Set to null or omit to auto-compute.")
     sampling_zmin: float = Field(..., description="Min z for adsorbate placement (Å)")
     sampling_zmax: float = Field(..., description="Max z for adsorbate placement (Å)")
+    binding_z_offset: float = Field(
+        default=2.0, gt=0.0,
+        description="Initial z-offset above slab top for site-aware placement (Å)",
+    )
+    snap_z_min_offset: float = Field(
+        default=0.8, gt=0.0,
+        description="Minimum z above slab top after snap-to-surface (Å)",
+    )
+    snap_z_max_offset: float = Field(
+        default=4.0, gt=0.0,
+        description="Maximum z above slab top after snap-to-surface (Å)",
+    )
+    placement_clash_scale: float = Field(
+        default=0.7, gt=0.0,
+        description=(
+            "Fraction of summed covalent radii used as clash threshold "
+            "during random placement. Lower = more permissive."
+        ),
+    )
 
     @model_validator(mode="after")
     def _zmin_lt_zmax(self) -> SlabConfig:
         if self.sampling_zmin >= self.sampling_zmax:
             raise ValueError("sampling_zmin must be < sampling_zmax")
+        if self.snap_z_min_offset >= self.snap_z_max_offset:
+            raise ValueError("snap_z_min_offset must be < snap_z_max_offset")
         return self
 
 
@@ -34,7 +54,6 @@ class AdsorbateConfig(BaseModel):
     symbol: str = Field(..., description="Chemical symbol or formula")
     chemical_potential: float | None = Field(default=None,
         description="Standard chemical potential (eV). Set to null or omit to auto-compute via CHE.")
-    n_orientations: int = Field(default=1, ge=1)
     min_count: int = Field(default=0, ge=0)
     max_count: int = Field(default=5, ge=0)
     binding_index: int = Field(default=0, ge=0, description="Index of the surface-binding atom")
@@ -57,12 +76,15 @@ class AdsorbateConfig(BaseModel):
     @model_validator(mode="after")
     def _require_geometry_for_polyatomic(self) -> AdsorbateConfig:
         from galoop.science.surface import parse_formula
-        if len(parse_formula(self.symbol)) > 1:
-            if self.geometry is None and self.coordinates is None:
-                raise ValueError(
-                    f"Adsorbate '{self.symbol}' has multiple atoms; "
-                    "specify 'geometry' (file path) or 'coordinates' (inline positions) in the config"
-                )
+        if (
+            len(parse_formula(self.symbol)) > 1
+            and self.geometry is None
+            and self.coordinates is None
+        ):
+            raise ValueError(
+                f"Adsorbate '{self.symbol}' has multiple atoms; "
+                "specify 'geometry' (file path) or 'coordinates' (inline positions) in the config"
+            )
         return self
 
     @model_validator(mode="after")
@@ -70,6 +92,7 @@ class AdsorbateConfig(BaseModel):
         if self.coordinates is None:
             return self
         from collections import Counter
+
         from galoop.science.surface import parse_formula
 
         rows = self.coordinates
@@ -175,7 +198,7 @@ class OperatorWeightsConfig(BaseModel):
     mutate_translate: float = Field(default=0.23, ge=0.0)
 
     @model_validator(mode="after")
-    def _nonzero_sum(self) -> "OperatorWeightsConfig":
+    def _nonzero_sum(self) -> OperatorWeightsConfig:
         total = (self.splice + self.merge + self.mutate_add
                  + self.mutate_remove + self.mutate_displace
                  + self.mutate_rattle_slab + self.mutate_translate)

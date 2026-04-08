@@ -17,7 +17,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from galoop.individual import Individual, STATUS, OPERATOR
+from galoop.individual import STATUS, Individual
 
 log = logging.getLogger(__name__)
 
@@ -138,15 +138,16 @@ class GaloopStore:
         return d
 
     def close(self) -> None:
-        """Close the database connection, checkpointing WAL first."""
-        try:
+        """Close the database connection, checkpointing WAL first.
+
+        Both calls are best-effort; we don't want a teardown failure to mask
+        a more interesting upstream exception.
+        """
+        import contextlib
+        with contextlib.suppress(sqlite3.Error):
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            pass
-        try:
+        with contextlib.suppress(sqlite3.Error):
             self._conn.close()
-        except Exception:
-            pass
 
     # -- individual directory -------------------------------------------------
 

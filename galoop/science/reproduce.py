@@ -7,7 +7,6 @@ GA operators: splice, merge, add / remove / displace / translate mutations.
 from __future__ import annotations
 
 import logging
-from typing import Tuple
 
 import numpy as np
 from ase import Atoms
@@ -75,7 +74,7 @@ def splice(
     parent_b: Atoms,
     n_slab: int,
     rng: np.random.Generator | None = None,
-) -> Tuple[Atoms, Atoms]:
+) -> tuple[Atoms, Atoms]:
     """
     Molecule-aware Z-cut splice.
 
@@ -359,7 +358,6 @@ def mutate_translate(
         return None
 
     mol = molecules[int(rng.integers(len(molecules)))]
-    other_mol_atoms = [i for m in molecules if m is not mol for i in m]
 
     base_pos = atoms.get_positions()
     current_xy = base_pos[mol][:, :2].mean(axis=0)
@@ -367,7 +365,8 @@ def mutate_translate(
     try:
         from galoop.science.surface import find_surface_sites
         sites = find_surface_sites(atoms, n_slab)
-    except Exception:
+    except Exception as exc:
+        log.debug("find_surface_sites failed in mutate_translate: %s", exc)
         sites = []
 
     def _build_child(delta):
@@ -425,7 +424,7 @@ def crossover_operator(
     n_slab: int,
     operator_type: str = "splice",
     rng: np.random.Generator | None = None,
-) -> Atoms | Tuple[Atoms, Atoms]:
+) -> Atoms | tuple[Atoms, Atoms]:
     if operator_type == "splice":
         return splice(parent_a, parent_b, n_slab, rng)
     elif operator_type == "merge":

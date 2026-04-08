@@ -16,7 +16,9 @@ from pathlib import Path
 
 from ase import Atoms
 from ase.build import molecule
-from ase.io import read, write
+from ase.io import write
+
+from galoop.science.surface import read_atoms
 
 log = logging.getLogger(__name__)
 
@@ -47,8 +49,9 @@ def _decompose_formula(symbol: str) -> dict[str, int]:
 
     Handles formulas like O, OH, H2O, OOH, HCOO, NO, NH3, CH3OH, etc.
     """
-    from galoop.science.surface import parse_formula
     from collections import Counter
+
+    from galoop.science.surface import parse_formula
     return dict(Counter(parse_formula(symbol)))
 
 
@@ -103,7 +106,7 @@ def _resolve_elemental_potentials(
     needed_elements: set[str],
     config,
     cal_dir: Path,
-) -> dict[str, float]:
+) -> tuple[dict[str, float], dict[str, float]]:
     """Compute per-element chemical potentials from reference molecules.
 
     For each reference molecule, relax it through the pipeline and solve
@@ -117,19 +120,31 @@ def _resolve_elemental_potentials(
     mu: dict[str, float] = {}
     mol_energies: dict[str, float] = {}
 
+    # Walk references in dependency order. We resolve every reference that
+    # has exactly one unknown element, regardless of whether that element is
+    # in *needed_elements* — the dependencies (e.g. H2 must be solved before
+    # H2O can give us O) can drag in elements that the caller didn't ask for
+    # directly. The final missing-element check below catches anything that
+    # genuinely can't be resolved.
     for mol_formula, composition in _DEFAULT_REFERENCES:
-        # Check if this molecule provides any element we still need
         elements_in_mol = set(composition.keys())
         unsolved = elements_in_mol - set(mu.keys())
-        if not (unsolved & needed_elements):
+
+        # Skip references where every element is already known.
+        if not unsolved:
             continue
-        # All elements except one must already be solved
-        if len(unsolved) > 1:
-            log.warning(
-                "Cannot resolve %s from %s — need %s solved first",
-                unsolved, mol_formula, unsolved - {next(iter(unsolved))},
+        # Need exactly one unknown to solve algebraically.
+        if len(unsolved) != 1:
+            log.debug(
+                "Skipping %s for now (%d unknown elements)", mol_formula, len(unsolved),
             )
             continue
+
+        # Skip if neither this molecule nor any later one can contribute to
+        # the requested elements. Cheap heuristic: only relax if we still
+        # have a needed element unresolved.
+        if not (needed_elements - set(mu.keys())):
+            break
 
         log.info("  Relaxing %s …", mol_formula)
         e_mol = _run_pipeline(
@@ -203,7 +218,7 @@ def calibrate(config, run_dir: Path | None = None) -> dict:
     # --- Slab energy ---
     if needs_slab:
         log.info("  Relaxing bare slab …")
-        slab = read(str(config.slab.geometry), format="vasp")
+        slab = read_atoms(config.slab.geometry, format="vasp")
         e_slab = _run_pipeline(
             slab, cal_dir / "slab",
             config, n_slab_atoms=len(slab),

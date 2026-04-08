@@ -6,14 +6,17 @@ Command-line interface.
 Usage
 -----
 galoop run --config galoop.yaml   # Start / resume the GA loop
-galoop sample -c galoop.yaml -n 200 -o samples/   # Generate N unique structures
+galoop sample -c galoop.yaml -n 200 -o samples.xyz   # Generate N unique structures
 galoop status -d .                # Print structure counts
-galoop report -d .                # Generate HTML report
 """
+
+from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import click
 import numpy as np
@@ -40,7 +43,7 @@ def cli():
 def run(config: str, run_dir: str, seed: int | None, verbose: bool):
     """Start or resume the GA loop."""
     from galoop.galoop import run as run_ga
-    from galoop.science.surface import load_slab
+    from galoop.science.surface import load_slab_from_config
 
     logging.basicConfig(
         format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -75,11 +78,7 @@ def run(config: str, run_dir: str, seed: int | None, verbose: bool):
             from galoop.calibrate import calibrate
             calibrate(cfg, run_dir=run_dir_path)
 
-        slab_info = load_slab(
-            cfg.slab.geometry,
-            zmin=cfg.slab.sampling_zmin,
-            zmax=cfg.slab.sampling_zmax,
-        )
+        slab_info = load_slab_from_config(cfg.slab)
 
         store = GaloopStore(run_dir_path)
         current_cfg = cfg.model_dump()
@@ -142,224 +141,46 @@ def status(run_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# report
-# ---------------------------------------------------------------------------
-
-@cli.command()
-@click.option("--run-dir", "-d", default=".", type=click.Path())
-@click.option("--config", "-c", default=None, type=click.Path())
-@click.option("--output", "-o", default=None, type=click.Path(),
-              help="Output HTML path (default: <run-dir>/report.html)")
-@click.option("--top", default=20, type=int, help="Number of top structures to list")
-def report(run_dir: str, config: str | None, output: str | None, top: int):
-    """Generate a self-contained HTML status report."""
-    from galoop.report import generate
-
-    run_dir_path = Path(run_dir).resolve()
-    db_path = run_dir_path / "galoop.db"
-
-    if not db_path.exists():
-        click.echo(f"No database at {db_path}", err=True)
-        sys.exit(1)
-
-    cfg_path = Path(config).resolve() if config else run_dir_path / "galoop.yaml"
-    if not cfg_path.exists():
-        click.echo(f"Config not found: {cfg_path}  (pass --config to specify)", err=True)
-        sys.exit(1)
-
-    try:
-        cfg = load_config(cfg_path)
-    except Exception as exc:
-        click.echo(f"Config error: {exc}", err=True)
-        sys.exit(1)
-
-    out = Path(output) if output else run_dir_path / "report.html"
-    store = GaloopStore(run_dir_path)
-
-    # Backfill auto-calibrated values from stored config snapshot
-    import json
-    row = store._conn.execute(
-        "SELECT value FROM run_params WHERE key = ?", ("config",)
-    ).fetchone()
-    if row is not None:
-        stored = json.loads(row["value"])
-        if cfg.slab.energy is None and "slab" in stored:
-            cfg.slab.energy = stored["slab"].get("energy")
-        for ads in cfg.adsorbates:
-            if ads.chemical_potential is None:
-                for stored_ads in stored.get("adsorbates", []):
-                    if stored_ads.get("symbol") == ads.symbol:
-                        ads.chemical_potential = stored_ads.get("chemical_potential")
-                        break
-
-    generate(project=store, cfg=cfg, output_path=out, top_n=top)
-    store.close()
-    click.echo(f"Report written to {out}")
-
-
-# ---------------------------------------------------------------------------
-# graph
-# ---------------------------------------------------------------------------
-
-@cli.command("graph")
-@click.option("--run-dir", "-d", default=".", type=click.Path(exists=True))
-@click.option("--config", "-c", default="galoop.yaml", type=click.Path(exists=True))
-@click.option("--converged", is_flag=True,
-              help="Show all unique converged structures instead of duplicate clusters.")
-@click.option("--output", "-o", default=None,
-              help="Output HTML path (default: <run-dir>/graphs.html)")
-@click.option("--radius", default=2, type=int, show_default=True,
-              help="Graph environment radius.")
-def graph(run_dir: str, config: str, converged: bool, output: str | None, radius: int):
-    """Visualise adsorbate chemical-environment graphs in the browser."""
-    import webbrowser
-
-    from ase.io import read as ase_read
-
-    from galoop import graph_viz
-    from galoop.fingerprint import build_chem_envs
-    from galoop.individual import STATUS
-    from galoop.science.surface import load_slab
-
-    run_dir_path = Path(run_dir).resolve()
-    cfg_path = Path(config).resolve()
-    db_path = run_dir_path / "galoop.db"
-
-    if not db_path.exists():
-        click.echo(f"No database at {db_path}", err=True)
-        sys.exit(1)
-
-    try:
-        cfg = load_config(cfg_path)
-    except Exception as exc:
-        click.echo(f"Config error: {exc}", err=True)
-        sys.exit(1)
-
-    slab_path = cfg_path.parent / cfg.slab.geometry
-    try:
-        slab_info = load_slab(slab_path, cfg.slab.sampling_zmin, cfg.slab.sampling_zmax)
-    except Exception as exc:
-        click.echo(f"Could not load slab: {exc}", err=True)
-        sys.exit(1)
-
-    store = GaloopStore(run_dir_path)
-    all_converged = store.get_by_status(STATUS.CONVERGED)
-    all_dups = store.get_by_status(STATUS.DUPLICATE)
-
-    out_path = Path(output) if output else run_dir_path / "graphs.html"
-    pages: list[dict] = []
-
-    def _load_atoms(ind):
-        struct_dir = store.individual_dir(ind.id)
-        for name in ("CONTCAR", "POSCAR"):
-            candidate = struct_dir / name
-            if candidate.exists():
-                try:
-                    return ase_read(str(candidate), format="vasp")
-                except Exception:
-                    return None
-        return None
-
-    def _build_page_for(ind, title: str) -> dict | None:
-        atoms = _load_atoms(ind)
-        if atoms is None:
-            return None
-        envs = build_chem_envs(atoms, slab_info.n_slab_atoms, radius=radius)
-        if not envs:
-            return None
-        return graph_viz.build_page(title, envs)
-
-    if converged:
-        sorted_conv = sorted(
-            all_converged,
-            key=lambda x: (x.grand_canonical_energy is None,
-                           x.grand_canonical_energy or 0.0),
-        )
-        total = len(sorted_conv)
-        for i, ind in enumerate(sorted_conv, 1):
-            gce = (f"G={ind.grand_canonical_energy:.4f} eV"
-                   if ind.grand_canonical_energy is not None else "G=N/A")
-            page = _build_page_for(ind, f"[{i}/{total}] {ind.id}  {gce}")
-            if page:
-                pages.append(page)
-    else:
-        clusters: dict[str, list] = {}
-        for dup in all_dups:
-            dup_of = dup.extra_data.get("dup_of")
-            if dup_of:
-                clusters.setdefault(dup_of, []).append(dup)
-
-        sorted_conv = sorted(
-            all_converged,
-            key=lambda x: (x.grand_canonical_energy is None,
-                           x.grand_canonical_energy or 0.0),
-        )
-        total_unique = len(sorted_conv)
-        for rank, orig in enumerate(sorted_conv, 1):
-            n_dups = len(clusters.get(orig.id, []))
-            gce = (f"G={orig.grand_canonical_energy:.4f} eV"
-                   if orig.grand_canonical_energy is not None else "G=N/A")
-            dup_tag = f"  +{n_dups} dup{'s' if n_dups != 1 else ''}" if n_dups else ""
-            page = _build_page_for(orig,
-                                   f"[{rank}/{total_unique}] {orig.id}  {gce}{dup_tag}")
-            if page:
-                pages.append(page)
-
-            for dup in clusters.get(orig.id, []):
-                tanimoto = dup.extra_data.get("tanimoto")
-                sim_str = (f"Tanimoto={tanimoto:.3f}" if tanimoto is not None
-                           else "Tanimoto=N/A")
-                page = _build_page_for(dup,
-                                       f"  DUP {dup.id}  {sim_str}  (orig {orig.id})")
-                if page:
-                    pages.append(page)
-
-    store.close()
-
-    if not pages:
-        click.echo("No graphs to display.", err=True)
-        sys.exit(1)
-
-    graph_viz.generate_html(pages, out_path)
-    click.echo(f"Graph viewer written to {out_path}")
-    webbrowser.open(out_path.as_uri())
-
-
-# ---------------------------------------------------------------------------
 # sample — generate N unique starting structures (no GA loop)
 # ---------------------------------------------------------------------------
 
-# Per-process worker globals, populated by _sample_worker_init.
-_W: dict = {}
+@dataclass
+class _SamplerWorkerState:
+    """Per-process state for the parallel placement-only sampler.
+
+    Stored module-level so worker processes inherit it via the
+    ``initializer`` argument to ``ProcessPoolExecutor``. Wrapped in a
+    dataclass so static checkers see real attribute types instead of
+    ``dict[str, object]``.
+    """
+    cfg: Any
+    slab_info: Any
+    ads_atoms: dict
+    soap_kwargs: Any   # SoapKwargs (TypedDict; lazy import to avoid cycle)
+
+
+_W: _SamplerWorkerState | None = None
 
 
 def _sample_worker_init(config_path: str):
     """Initialise a sampler worker process: load config, slab, adsorbates."""
+    global _W
     from galoop.config import load_config
-    from galoop.science.surface import load_adsorbate, load_slab
+    from galoop.fingerprint import SoapKwargs
+    from galoop.science.surface import load_ads_template_dict, load_slab_from_config
 
     cfg = load_config(Path(config_path))
-    slab_info = load_slab(
-        cfg.slab.geometry,
-        zmin=cfg.slab.sampling_zmin,
-        zmax=cfg.slab.sampling_zmax,
-    )
-    ads_atoms = {
-        a.symbol: load_adsorbate(
-            symbol=a.symbol,
-            geometry=getattr(a, "geometry", None),
-            coordinates=getattr(a, "coordinates", None),
-        )
-        for a in cfg.adsorbates
-    }
-    _W["cfg"] = cfg
-    _W["slab_info"] = slab_info
-    _W["ads_atoms"] = ads_atoms
-    _W["soap_kwargs"] = dict(
-        r_cut=cfg.fingerprint.r_cut,
-        n_max=cfg.fingerprint.n_max,
-        l_max=cfg.fingerprint.l_max,
-        n_slab_atoms=slab_info.n_slab_atoms,
+    slab_info = load_slab_from_config(cfg.slab)
+    _W = _SamplerWorkerState(
+        cfg=cfg,
+        slab_info=slab_info,
+        ads_atoms=load_ads_template_dict(cfg.adsorbates),
+        soap_kwargs=SoapKwargs(
+            r_cut=cfg.fingerprint.r_cut,
+            n_max=cfg.fingerprint.n_max,
+            l_max=cfg.fingerprint.l_max,
+            n_slab_atoms=slab_info.n_slab_atoms,
+        ),
     )
 
 
@@ -374,15 +195,17 @@ def _sample_worker_attempt(target_total: int, seed: int) -> dict | None:
     from galoop.fingerprint import compute_soap
     from galoop.galoop import _random_stoichiometry
     from galoop.science.surface import (
+        build_random_structure,
         detect_desorption,
-        place_adsorbate,
         validate_surface_binding,
     )
 
-    cfg = _W["cfg"]
-    slab_info = _W["slab_info"]
-    ads_atoms = _W["ads_atoms"]
-    soap_kwargs = _W["soap_kwargs"]
+    state = _W
+    assert state is not None, "_sample_worker_init must run before _sample_worker_attempt"
+    cfg = state.cfg
+    slab_info = state.slab_info
+    ads_atoms = state.ads_atoms
+    soap_kwargs = state.soap_kwargs
 
     rng = _np.random.default_rng(seed)
 
@@ -390,20 +213,9 @@ def _sample_worker_attempt(target_total: int, seed: int) -> dict | None:
         counts = _random_stoichiometry(
             cfg.adsorbates, rng, target_total, target_total,
         )
-        current = slab_info.atoms.copy()
-        for sym, cnt in counts.items():
-            ads_cfg = next(a for a in cfg.adsorbates if a.symbol == sym)
-            for _ in range(cnt):
-                current = place_adsorbate(
-                    slab=current,
-                    adsorbate=ads_atoms[sym],
-                    zmin=slab_info.zmin,
-                    zmax=slab_info.zmax,
-                    n_orientations=ads_cfg.n_orientations,
-                    binding_index=ads_cfg.binding_index,
-                    rng=rng,
-                    n_slab_atoms=slab_info.n_slab_atoms,
-                )
+        current = build_random_structure(
+            slab_info, cfg.adsorbates, ads_atoms, counts, rng,
+        )
     except Exception as exc:
         return {"reject": "placement", "error": str(exc)}
 
@@ -472,8 +284,7 @@ def sample(config: str, output: str, n_structures: int, relax: bool,
     from galoop.fingerprint import compute_soap, tanimoto_similarity
     from galoop.science.surface import (
         detect_desorption,
-        load_adsorbate,
-        load_slab,
+        load_slab_from_config,
         validate_surface_binding,
     )
 
@@ -509,30 +320,25 @@ def sample(config: str, output: str, n_structures: int, relax: bool,
     rejected = {"placement": 0, "relax": 0, "desorbed": 0,
                 "unbound": 0, "duplicate": 0, "fingerprint": 0}
 
-    base_seed = int(seed) if seed is not None else int(np.random.SeedSequence().entropy & 0xFFFFFFFF)
+    if seed is not None:
+        base_seed = int(seed)
+    else:
+        # secrets.randbits is correctly typed (-> int) so ty stays happy.
+        import secrets
+        base_seed = secrets.randbits(32)
 
     # ====================================================================
     # Path A: --relax (sequential, MACE in-process). Heavy, low throughput.
     # ====================================================================
     if relax:
         from galoop.engine.calculator import build_pipeline
+        from galoop.fingerprint import SoapKwargs
         from galoop.galoop import _random_stoichiometry, _snap_to_surface
-        from galoop.science.surface import place_adsorbate
+        from galoop.science.surface import build_random_structure, load_ads_template_dict
 
-        slab_info = load_slab(
-            cfg.slab.geometry,
-            zmin=cfg.slab.sampling_zmin,
-            zmax=cfg.slab.sampling_zmax,
-        )
-        ads_atoms = {
-            a.symbol: load_adsorbate(
-                symbol=a.symbol,
-                geometry=getattr(a, "geometry", None),
-                coordinates=getattr(a, "coordinates", None),
-            )
-            for a in cfg.adsorbates
-        }
-        soap_kwargs = dict(
+        slab_info = load_slab_from_config(cfg.slab)
+        ads_atoms = load_ads_template_dict(cfg.adsorbates)
+        soap_kwargs: SoapKwargs = SoapKwargs(
             r_cut=fp_cfg.r_cut,
             n_max=fp_cfg.n_max,
             l_max=fp_cfg.l_max,
@@ -554,17 +360,9 @@ def sample(config: str, output: str, n_structures: int, relax: bool,
             target = coverage_levels[(attempt - 1) % len(coverage_levels)]
             try:
                 counts = _random_stoichiometry(cfg.adsorbates, rng, target, target)
-                current = slab_info.atoms.copy()
-                for sym, cnt in counts.items():
-                    ads_cfg = next(a for a in cfg.adsorbates if a.symbol == sym)
-                    for _ in range(cnt):
-                        current = place_adsorbate(
-                            slab=current, adsorbate=ads_atoms[sym],
-                            zmin=slab_info.zmin, zmax=slab_info.zmax,
-                            n_orientations=ads_cfg.n_orientations,
-                            binding_index=ads_cfg.binding_index, rng=rng,
-                            n_slab_atoms=slab_info.n_slab_atoms,
-                        )
+                current = build_random_structure(
+                    slab_info, cfg.adsorbates, ads_atoms, counts, rng,
+                )
             except Exception as exc:
                 log.debug("attempt %d: placement failed (%s)", attempt, exc)
                 rejected["placement"] += 1
@@ -635,10 +433,10 @@ def sample(config: str, output: str, n_structures: int, relax: bool,
                      next_id, n_structures, next_id, dict(counts), energy)
             next_id += 1
 
-        try:
+        # Clean up the relax scratch directory if it's empty (best-effort).
+        import contextlib
+        with contextlib.suppress(OSError):
             work_root.rmdir()
-        except OSError:
-            pass
 
     # ====================================================================
     # Path B: placement-only, parallel via ProcessPoolExecutor. Default.
@@ -650,11 +448,7 @@ def sample(config: str, output: str, n_structures: int, relax: bool,
 
         # Cheap re-load on the parent for the dedup hash and metadata.
         # n_slab_atoms is needed when stamping the xyz comments.
-        slab_info = load_slab(
-            cfg.slab.geometry,
-            zmin=cfg.slab.sampling_zmin,
-            zmax=cfg.slab.sampling_zmax,
-        )
+        slab_info = load_slab_from_config(cfg.slab)
 
         # Each task gets a unique attempt_id; the worker derives a deterministic
         # per-attempt RNG from base_seed + attempt_id so the run is reproducible.

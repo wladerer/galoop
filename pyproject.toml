@@ -1,0 +1,50 @@
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = [
+    "E501",   # line length owned by formatter
+    "B008",   # allow function calls in default args (click decorators)
+    "SIM108", # ternary not always clearer
+    "UP045",  # Optional vs X | None — keep both until typing pass
+    # Allow en/em dashes in physics docstrings (1.8–2.2 Å, etc.)
+    "RUF001", # ambiguous-unicode-string
+    "RUF002", # ambiguous-unicode-docstring
+    "RUF003", # ambiguous-unicode-comment
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "B018"]
+
+[tool.ty]
+# Astral's type checker. Conservative baseline; tighten per-module later.
+
+[tool.ty.src]
+include = ["galoop"]
+exclude = ["galoop/_stubs", "tests"]
+
+[tool.coverage.run]
+source = ["galoop"]
+branch = true
+omit = [
+    "galoop/__init__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+precision = 1
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]

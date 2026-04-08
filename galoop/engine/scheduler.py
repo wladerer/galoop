@@ -10,10 +10,9 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import parsl
 from parsl.app.app import python_app
 from parsl.config import Config
-from parsl.executors import HighThroughputExecutor, ThreadPoolExecutor
+from parsl.executors import HighThroughputExecutor
 from parsl.providers import LocalProvider, SlurmProvider, TorqueProvider
 
 log = logging.getLogger(__name__)
@@ -38,17 +37,18 @@ def relax_structure(
     keys: converged, final_energy, stage_results, final_atoms.
     """
     from pathlib import Path
-    from ase.io import read
-    from galoop.engine.calculator import build_pipeline
 
-    struct_dir = Path(struct_dir)
-    poscar = struct_dir / "POSCAR"
-    atoms = read(str(poscar), format="vasp")
+    from galoop.engine.calculator import build_pipeline
+    from galoop.science.surface import read_atoms
+
+    struct_path = Path(struct_dir)
+    poscar = struct_path / "POSCAR"
+    atoms = read_atoms(poscar, format="vasp")
 
     pipeline = build_pipeline(stage_configs)
     return pipeline.run(
         atoms,
-        struct_dir,
+        struct_path,
         mace_model=mace_model,
         mace_device=mace_device,
         mace_dtype=mace_dtype,

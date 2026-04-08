@@ -24,7 +24,7 @@ setup(
         "pytest"
     ],
     extras_require={
-        "dev": ["pytest", "black", "flake8"],
+        "dev": ["pytest", "pytest-cov", "ruff", "ty"],
     },
     entry_points={
         "console_scripts": [

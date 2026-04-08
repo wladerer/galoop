@@ -9,13 +9,16 @@ Each stage relaxes the geometry and writes a CONTCAR for the next stage.
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import numpy as np
 from ase import Atoms
-from ase.io import read, write
+from ase.io import write
 from ase.optimize import BFGS
+
+from galoop.science.surface import read_atoms
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +45,7 @@ class CalculatorStage:
     def __init__(
         self,
         name: str,
-        type: str,                       # noqa: A002 — shadows builtin; kept for config compat
+        type: str,
         fmax: float = 0.05,
         max_steps: int = 300,
         energy_per_atom_tol: float = 10.0,
@@ -101,7 +104,7 @@ class CalculatorStage:
                 prescan_contcar = prescan_dir / "CONTCAR"
                 if prescan_contcar.exists():
                     try:
-                        loaded = read(str(prescan_contcar), format="vasp")
+                        loaded = read_atoms(prescan_contcar, format="vasp")
                         loaded.set_constraint(atoms.constraints)
                         atoms = loaded
                     except Exception as exc:
@@ -120,9 +123,11 @@ class CalculatorStage:
 
     # -- MACE --------------------------------------------------------------
 
-    # Class-level cache for loaded MACE calculators (thread-safe reuse)
-    _mace_cache: dict[tuple, object] = {}
-    _mace_lock = None  # lazily initialised threading.Lock
+    # Class-level cache for loaded MACE calculators (thread-safe reuse).
+    # ClassVar so type checkers and ruff RUF012 understand the intent: this
+    # is shared state, not a per-instance default.
+    _mace_cache: ClassVar[dict[tuple, object]] = {}
+    _mace_lock: ClassVar[threading.Lock | None] = None
 
     @classmethod
     def _get_mace_calc(cls, mace_model: str, mace_device: str, mace_dtype: str):
@@ -131,15 +136,15 @@ class CalculatorStage:
         torch.jit.load is not thread-safe, so a lock serialises the first
         load.  Subsequent calls return a cached calculator.
         """
-        import threading
         if cls._mace_lock is None:
             cls._mace_lock = threading.Lock()
+        lock = cls._mace_lock  # local binding so the narrowing sticks
 
         key = (mace_model, mace_device, mace_dtype)
         if key in cls._mace_cache:
             return cls._mace_cache[key]
 
-        with cls._mace_lock:
+        with lock:
             # Double-check after acquiring lock
             if key in cls._mace_cache:
                 return cls._mace_cache[key]
@@ -179,10 +184,9 @@ class CalculatorStage:
         atoms = atoms.copy()
         # Cached MACE calculator retains stale results from prior atoms of a
         # different size — clear before reuse to avoid shape-mismatch errors.
-        try:
+        import contextlib
+        with contextlib.suppress(AttributeError):
             calc.results.clear()
-        except AttributeError:
-            pass
         atoms.calc = calc
 
         traj_path = stage_dir / "trajectory.traj"
@@ -264,7 +268,7 @@ class CalculatorStage:
         contcar = stage_dir / "CONTCAR"
         if contcar.exists():
             try:
-                atoms = read(str(contcar), format="vasp")
+                atoms = read_atoms(contcar, format="vasp")
             except Exception as exc:
                 log.warning("Failed to read VASP CONTCAR: %s", exc)
 
@@ -340,7 +344,7 @@ class Pipeline:
             contcar = struct_dir / f"stage_{stage.name}" / "CONTCAR"
             if contcar.exists():
                 try:
-                    current_atoms = read(str(contcar), format="vasp")
+                    current_atoms = read_atoms(contcar, format="vasp")
                 except Exception as exc:
                     log.warning("Failed to load %s output: %s", stage.name, exc)
                     all_converged = False
@@ -353,16 +357,18 @@ class Pipeline:
             # Inter-stage connectivity check: verify adsorbates are surface-bound.
             # Use generous cutoff (1.5×) since geometry may not be fully relaxed.
             # The stricter post-relax check in the harvest loop catches the rest.
-            if (n_slab_atoms > 0
-                    and n_slab_atoms < len(current_atoms)
-                    and len(self.stages) > 1):
-                if not _check_surface_binding(current_atoms, n_slab_atoms, bond_mult=1.5):
-                    log.warning(
-                        "%s produced unbound adsorbate molecule(s) — aborting pipeline",
-                        stage.name,
-                    )
-                    all_converged = False
-                    break
+            if (
+                n_slab_atoms > 0
+                and n_slab_atoms < len(current_atoms)
+                and len(self.stages) > 1
+                and not _check_surface_binding(current_atoms, n_slab_atoms, bond_mult=1.5)
+            ):
+                log.warning(
+                    "%s produced unbound adsorbate molecule(s) — aborting pipeline",
+                    stage.name,
+                )
+                all_converged = False
+                break
 
         # Write final outputs
         final_contcar = struct_dir / "CONTCAR"

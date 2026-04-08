@@ -13,7 +13,6 @@ from typing import NamedTuple
 
 import numpy as np
 from ase import Atoms
-from ase.constraints import FixAtoms
 from ase.io import read
 from ase.neighborlist import NeighborList, natural_cutoffs
 
@@ -31,16 +30,63 @@ class SlabInfo(NamedTuple):
     zmin: float
     zmax: float
     symbols: list[str]
+    binding_z_offset: float = 2.0
+    snap_z_min_offset: float = 0.8
+    snap_z_max_offset: float = 4.0
+    placement_clash_scale: float = 0.7
 
 
 # ---------------------------------------------------------------------------
 # Slab loading
 # ---------------------------------------------------------------------------
 
+def read_atoms(path: str | Path, **kwargs) -> Atoms:
+    """Read a single :class:`Atoms` object from *path*.
+
+    Wraps :func:`ase.io.read` and narrows its ``Atoms | list[Atoms]`` return
+    type for static checkers (and for our own sanity — every call site in
+    galoop expects exactly one frame).
+    """
+    result = read(str(path), **kwargs)
+    if isinstance(result, list):
+        if len(result) != 1:
+            raise ValueError(
+                f"Expected a single frame in {path}, got {len(result)}"
+            )
+        single = result[0]
+        if not isinstance(single, Atoms):
+            raise TypeError(
+                f"Expected Atoms in {path}, got {type(single).__name__}"
+            )
+        return single
+    return result
+
+
+def load_slab_from_config(slab_cfg) -> SlabInfo:
+    """Build a :class:`SlabInfo` directly from a :class:`SlabConfig`.
+
+    Convenience wrapper used by every CLI subcommand and the GA loop —
+    avoids re-spelling all the SlabConfig fields at every call site.
+    """
+    return load_slab(
+        slab_cfg.geometry,
+        zmin=slab_cfg.sampling_zmin,
+        zmax=slab_cfg.sampling_zmax,
+        binding_z_offset=slab_cfg.binding_z_offset,
+        snap_z_min_offset=slab_cfg.snap_z_min_offset,
+        snap_z_max_offset=slab_cfg.snap_z_max_offset,
+        placement_clash_scale=slab_cfg.placement_clash_scale,
+    )
+
+
 def load_slab(
     geometry_path: str | Path,
     zmin: float,
     zmax: float,
+    binding_z_offset: float = 2.0,
+    snap_z_min_offset: float = 0.8,
+    snap_z_max_offset: float = 4.0,
+    placement_clash_scale: float = 0.7,
 ) -> SlabInfo:
     """
     Load a slab POSCAR/CONTCAR geometry.
@@ -57,7 +103,7 @@ def load_slab(
     if not geometry_path.exists():
         raise FileNotFoundError(f"Slab geometry not found: {geometry_path}")
 
-    atoms = read(str(geometry_path), format="vasp")
+    atoms = read_atoms(geometry_path, format="vasp")
     n_slab = len(atoms)
 
     if atoms.constraints:
@@ -78,6 +124,10 @@ def load_slab(
         zmin=zmin,
         zmax=zmax,
         symbols=atoms.get_chemical_symbols(),
+        binding_z_offset=binding_z_offset,
+        snap_z_min_offset=snap_z_min_offset,
+        snap_z_max_offset=snap_z_max_offset,
+        placement_clash_scale=placement_clash_scale,
     )
 
 
@@ -102,7 +152,7 @@ def load_adsorbate(
         p = Path(geometry)
         if not p.exists():
             raise FileNotFoundError(f"Adsorbate geometry not found: {p}")
-        return read(str(p))
+        return read_atoms(p)
 
     if coordinates is not None:
         # New schema (validated in config.py): list of single-key dicts
@@ -123,6 +173,69 @@ def load_adsorbate(
         f"Adsorbate '{symbol}' has multiple atoms; "
         "specify 'geometry' (file path) or 'coordinates' (inline positions) in the config"
     )
+
+
+def load_ads_template_dict(ads_configs) -> dict[str, Atoms]:
+    """Build the ``{symbol: Atoms template}`` dict every spawn site needs.
+
+    Centralised here so callers don't keep re-spelling the comprehension.
+    """
+    return {
+        a.symbol: load_adsorbate(
+            symbol=a.symbol,
+            geometry=getattr(a, "geometry", None),
+            coordinates=getattr(a, "coordinates", None),
+        )
+        for a in ads_configs
+    }
+
+
+def build_random_structure(
+    slab_info,
+    ads_configs,
+    ads_atoms: dict[str, Atoms],
+    counts: dict[str, int],
+    rng: np.random.Generator,
+) -> Atoms:
+    """Place adsorbates on a fresh copy of the slab according to *counts*.
+
+    Single canonical implementation of the place-each-adsorbate loop. Used by
+    the GA's initial population, the ``_place_random`` and ``_spawn_gpr``
+    spawners, and the ``galoop sample`` worker.
+
+    Parameters
+    ----------
+    slab_info : SlabInfo
+        Provides ``atoms``, ``zmin``, ``zmax``, ``n_slab_atoms``.
+    ads_configs : iterable of AdsorbateConfig
+        Used to look up per-species ``binding_index``.
+    ads_atoms : dict[str, Atoms]
+        Pre-loaded adsorbate templates from ``load_ads_template_dict``.
+    counts : dict[str, int]
+        How many of each species to place.
+    rng : numpy Generator
+
+    Raises
+    ------
+    Whatever ``place_adsorbate`` raises (placement failures bubble up so
+    callers can decide whether to retry or fall back).
+    """
+    current = slab_info.atoms.copy()
+    for sym, cnt in counts.items():
+        ads_cfg = next(a for a in ads_configs if a.symbol == sym)
+        for _ in range(cnt):
+            current = place_adsorbate(
+                slab=current,
+                adsorbate=ads_atoms[sym],
+                zmin=slab_info.zmin,
+                zmax=slab_info.zmax,
+                binding_index=ads_cfg.binding_index,
+                rng=rng,
+                n_slab_atoms=slab_info.n_slab_atoms,
+                binding_z_offset=slab_info.binding_z_offset,
+                clash_scale=slab_info.placement_clash_scale,
+            )
+    return current
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +376,6 @@ def find_surface_sites(
         sites.append(p[:2].copy())
 
     # Find bonded pairs in the top layer (nearest-neighbor distance)
-    cell = slab.get_cell()
     nums = slab.get_atomic_numbers()
     for i in range(len(top_indices)):
         for j in range(i + 1, len(top_indices)):
@@ -301,12 +413,12 @@ def place_adsorbate(
     adsorbate: Atoms,
     zmin: float,
     zmax: float,
-    n_orientations: int = 1,
     binding_index: int = 0,
     rng: np.random.Generator | None = None,
     clash_scale: float = 0.7,
     max_attempts: int = 50,
     n_slab_atoms: int = 0,
+    binding_z_offset: float = 2.0,
 ) -> Atoms:
     """
     Place an adsorbate on the slab, preferring surface binding sites.
@@ -324,7 +436,6 @@ def place_adsorbate(
     slab : base slab (may already contain other adsorbates)
     adsorbate : adsorbate molecule to place
     zmin, zmax : vertical window (Å)
-    n_orientations : unused (kept for config compat; rotation is always random)
     binding_index : index of atom in adsorbate that binds to surface
     rng : NumPy random generator
     clash_scale : fraction of covalent-radii sum used as clash threshold
@@ -374,11 +485,9 @@ def place_adsorbate(
 
     combined = slab.copy()  # initialise so the variable is always bound
 
-    # Binding height: place binding atom ~1.8-2.2 Å above the actual slab top
-    # (not above previously placed adsorbates)
+    # Binding height: place binding atom *binding_z_offset* Å above the actual
+    # slab top (not above previously placed adsorbates)
     slab_top_z = slab.get_positions()[:n_slab_bare, 2].max()
-    from ase.data import covalent_radii as _cov_rad
-    binding_z_offset = 2.0  # reasonable default for most adsorbate-metal bonds
 
     for attempt in range(max_attempts):
         if attempt < len(sites):
@@ -513,6 +622,7 @@ def validate_surface_binding(
     atom-index lists for molecules with no surface contact.
     """
     from ase.neighborlist import NeighborList, natural_cutoffs
+
     from galoop.science.reproduce import _group_molecules
 
     if len(atoms) <= n_slab:

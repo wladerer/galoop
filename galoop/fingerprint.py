@@ -12,14 +12,23 @@ Detection uses a multi-stage cascade:
 
 from __future__ import annotations
 
-import itertools
 import logging
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 import numpy as np
 from ase import Atoms
 
 log = logging.getLogger(__name__)
+
+
+class SoapKwargs(TypedDict):
+    """Keyword arguments for ``compute_soap`` that callers commonly pass as
+    a single dict (so all sample / harvest sites stay in sync)."""
+    r_cut: float
+    n_max: int
+    l_max: int
+    n_slab_atoms: int
 
 
 # ---------------------------------------------------------------------------
@@ -183,168 +192,6 @@ def _energy_gate_passes(
     if abs(e_existing) < 1e-12:
         return True          # avoid divide-by-zero
     return abs(e_new - e_existing) / abs(e_existing) <= tol_pct / 100.0
-
-
-# ---------------------------------------------------------------------------
-# Graph-based chemical environment fingerprinting
-# ---------------------------------------------------------------------------
-
-def _grid_iterator(grid: tuple[int, int, int]):
-    """Iterate over (x, y, z) integer offsets within ±grid in each dimension."""
-    return itertools.product(*(range(-n, n + 1) for n in grid))
-
-
-def _bond_symbol(atoms: Atoms, a1: int, a2: int) -> str:
-    return "{}{}".format(*sorted((atoms[a1].symbol, atoms[a2].symbol)))
-
-
-def _node_symbol(atom, offset: tuple) -> str:
-    return "{}:{}[{},{},{}]".format(atom.symbol, atom.index, offset[0], offset[1], offset[2])
-
-
-def _connected_component_subgraphs(G):
-    import networkx as nx
-    for c in nx.connected_components(G):
-        yield G.subgraph(c)
-
-
-def _compare_chem_envs(chem_envs1: list, chem_envs2: list) -> bool:
-    """
-    Return True if two sets of adsorbate chemical environments are isomorphic.
-
-    Each environment is a networkx Graph.  Two sets match when every graph in
-    chem_envs1 has a unique isomorphic partner in chem_envs2 (bond-type edges
-    are matched; node identity is not required).
-    """
-    import networkx.algorithms.isomorphism as iso
-    bond_match = iso.categorical_edge_match("bond", "")
-
-    if len(chem_envs1) != len(chem_envs2):
-        return False
-
-    envs_copy = list(chem_envs2)
-    for env1 in chem_envs1:
-        for env2 in envs_copy:
-            import networkx as nx
-            if nx.is_isomorphic(env1, env2, edge_match=bond_match):
-                envs_copy.remove(env2)
-                break
-        else:
-            return False
-
-    return len(envs_copy) == 0
-
-
-def _unique_adsorbates(chem_envs: list) -> list:
-    """
-    Remove PBC-duplicate adsorbate graphs (same atom indices, same offsets).
-    """
-    import networkx as nx
-    import networkx.algorithms.isomorphism as iso
-    bond_match = iso.categorical_edge_match("bond", "")
-    ads_match = iso.categorical_node_match(["index", "ads"], [-1, False])
-
-    unique = []
-    for env in chem_envs:
-        for unique_env in unique:
-            if nx.is_isomorphic(env, unique_env, edge_match=bond_match, node_match=ads_match):
-                break
-        else:
-            unique.append(env)
-    return unique
-
-
-def build_chem_envs(
-    atoms: Atoms,
-    n_slab_atoms: int,
-    radius: int = 2,
-    grid: tuple[int, int, int] = (2, 2, 0),
-) -> list | None:
-    """
-    Build adsorbate chemical-environment graphs for *atoms*.
-
-    Returns a list of networkx Graphs (one per unique adsorbate), or ``None``
-    if networkx is not installed or there are no adsorbate atoms.
-
-    Parameters
-    ----------
-    atoms : slab + adsorbates ASE Atoms
-    n_slab_atoms : number of leading atoms that belong to the bare slab
-    radius : environment radius (graph hops, doubled internally for dist weighting)
-    grid : PBC repetitions (X, Y, Z) to avoid loops across periodic boundaries
-    """
-    try:
-        import networkx as nx
-        from ase.neighborlist import NeighborList, natural_cutoffs
-    except ImportError:
-        return None
-
-    adsorbate_atoms = list(range(n_slab_atoms, len(atoms)))
-    if not adsorbate_atoms:
-        return None
-
-    distances = atoms.get_all_distances(mic=True)
-    cutoffs = natural_cutoffs(atoms)
-    nl = NeighborList(cutoffs, self_interaction=False, bothways=True)
-    nl.update(atoms)
-
-    full = nx.Graph()
-
-    # Add all atom nodes for each grid repetition
-    for index, atom in enumerate(atoms):
-        for x, y, z in _grid_iterator(grid):
-            full.add_node(
-                _node_symbol(atom, (x, y, z)),
-                index=index,
-                ads=(index in adsorbate_atoms),
-                central_ads=False,
-            )
-
-    # Add all bond edges
-    for index, atom in enumerate(atoms):
-        for x, y, z in _grid_iterator(grid):
-            neighbors, offsets = nl.get_neighbors(index)
-            for neighbor, offset in zip(neighbors, offsets):
-                ox, oy, oz = int(offset[0]), int(offset[1]), int(offset[2])
-                if not (-grid[0] <= ox + x <= grid[0]):
-                    continue
-                if not (-grid[1] <= oy + y <= grid[1]):
-                    continue
-                if not (-grid[2] <= oz + z <= grid[2]):
-                    continue
-                # Skip long surface–adsorbate bonds (> 2.5 Å)
-                if distances[index][neighbor] > 2.5 and (
-                    bool(index in adsorbate_atoms) ^ bool(neighbor in adsorbate_atoms)
-                ):
-                    continue
-                dist_weight = 2 - (1 if index in adsorbate_atoms else 0) - (
-                    1 if neighbor in adsorbate_atoms else 0
-                )
-                ads_only = 0 if (index in adsorbate_atoms and neighbor in adsorbate_atoms) else 2
-                full.add_edge(
-                    _node_symbol(atom, (x, y, z)),
-                    _node_symbol(atoms[neighbor], (x + ox, y + oy, z + oz)),
-                    bond=_bond_symbol(atoms, index, neighbor),
-                    dist=dist_weight,
-                    ads_only=ads_only,
-                )
-
-    # Extract one graph per adsorbate (central atoms only, then expand to environment)
-    ads_nodes = [_node_symbol(atoms[i], (0, 0, 0)) for i in adsorbate_atoms]
-    ads_subgraph = nx.subgraph(full, ads_nodes)
-
-    chem_envs = []
-    for component in _connected_component_subgraphs(ads_subgraph):
-        initial = list(component.nodes())[0]
-        env = nx.ego_graph(full, initial, radius=(radius * 2) + 1, distance="dist")
-        env = nx.Graph(nx.subgraph(full, list(env.nodes())))
-        for node in component.nodes():
-            env.add_node(node, central_ads=True)
-        chem_envs.append(env)
-
-    chem_envs = _unique_adsorbates(chem_envs)
-    chem_envs.sort(key=lambda x: len(x.edges()))
-    return chem_envs
 
 
 # ---------------------------------------------------------------------------

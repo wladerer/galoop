@@ -22,6 +22,7 @@ incorporating reaction conditions:
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 
 import numpy as np
 
@@ -95,8 +96,8 @@ def _get_species_metadata(symbol: str) -> dict:
 
 def grand_canonical_energy(
     raw_energy: float,
-    adsorbate_counts: dict[str, int],
-    chemical_potentials: dict[str, float],
+    adsorbate_counts: Mapping[str, int],
+    chemical_potentials: Mapping[str, float],
     potential: float = 0.0,
     pH: float = 0.0,
     temperature: float = 298.15,

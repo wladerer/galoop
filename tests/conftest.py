@@ -62,13 +62,9 @@ def minimal_config(cu_slab_path):
 @pytest.fixture
 def slab_info(minimal_config):
     """SlabInfo loaded from the test slab."""
-    from galoop.science.surface import load_slab
+    from galoop.science.surface import load_slab_from_config
 
-    return load_slab(
-        minimal_config.slab.geometry,
-        zmin=minimal_config.slab.sampling_zmin,
-        zmax=minimal_config.slab.sampling_zmax,
-    )
+    return load_slab_from_config(minimal_config.slab)
 
 
 @pytest.fixture
