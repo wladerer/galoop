@@ -39,29 +39,29 @@ adsorbates:
   - symbol: NH
     min_count: 0
     max_count: 3
-    binding_index: 0        # defines the atom that binds to the surface
-    coordinates:
-      - [0.0, 0.0, 0.0]     # N
-      - [0.0, 0.0, 1.03]    # H
+    binding_index: 0        # row index of the atom that binds to the surface
+    coordinates:            # each row is {Element: [x, y, z]}
+      - N: [0.0, 0.0, 0.0]
+      - H: [0.0, 0.0, 1.03]
 
   - symbol: NH2
     min_count: 0
     max_count: 3
     binding_index: 0
     coordinates:
-      - [0.0, 0.0, 0.0]     # N
-      - [0.0, 0.82, 0.55]   # H
-      - [0.0, -0.82, 0.55]  # H
+      - N: [0.0, 0.0, 0.0]
+      - H: [0.0,  0.82, 0.55]
+      - H: [0.0, -0.82, 0.55]
 
   - symbol: NH3
     min_count: 0
     max_count: 3
     binding_index: 0
     coordinates:
-      - [0.0, 0.0, 0.0]      # N
-      - [0.0, 0.94, 0.39]     # H
-      - [0.81, -0.47, 0.39]   # H
-      - [-0.81, -0.47, 0.39]  # H
+      - N: [0.0, 0.0, 0.0]
+      - H: [ 0.0,   0.94, 0.39]
+      - H: [ 0.81, -0.47, 0.39]
+      - H: [-0.81, -0.47, 0.39]
 
   - symbol: H
     min_count: 0
