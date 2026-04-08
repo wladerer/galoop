@@ -39,7 +39,14 @@ class AdsorbateConfig(BaseModel):
     max_count: int = Field(default=5, ge=0)
     binding_index: int = Field(default=0, ge=0, description="Index of the surface-binding atom")
     geometry: str | None = Field(default=None, description="Path to geometry file")
-    coordinates: list[list[float]] | None = Field(default=None)
+    coordinates: list[dict[str, list[float]]] | None = Field(
+        default=None,
+        description=(
+            "Inline geometry as a list of single-key dicts mapping element symbol "
+            "to [x, y, z]. Example: [{C: [0,0,0]}, {O: [0,0,1.15]}]. "
+            "Row order defines atom indices (used by binding_index)."
+        ),
+    )
 
     @model_validator(mode="after")
     def _max_ge_min(self) -> AdsorbateConfig:
@@ -56,6 +63,52 @@ class AdsorbateConfig(BaseModel):
                     f"Adsorbate '{self.symbol}' has multiple atoms; "
                     "specify 'geometry' (file path) or 'coordinates' (inline positions) in the config"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_coordinates(self) -> AdsorbateConfig:
+        if self.coordinates is None:
+            return self
+        from collections import Counter
+        from galoop.science.surface import parse_formula
+
+        rows = self.coordinates
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict) or len(row) != 1:
+                raise ValueError(
+                    f"Adsorbate '{self.symbol}' coordinates row {i} must be a "
+                    f"single-key mapping {{symbol: [x,y,z]}}, got {row!r}. "
+                    "Old list-of-lists format is no longer supported — it was "
+                    "ambiguous about which row was which atom."
+                )
+            (sym, pos), = row.items()
+            if not isinstance(pos, list) or len(pos) != 3:
+                raise ValueError(
+                    f"Adsorbate '{self.symbol}' coordinates row {i} ({sym}): "
+                    f"position must be a list of 3 floats, got {pos!r}"
+                )
+            try:
+                row[sym] = [float(x) for x in pos]
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Adsorbate '{self.symbol}' coordinates row {i} ({sym}): "
+                    f"could not parse {pos!r} as floats — {exc}"
+                ) from exc
+
+        row_symbols = [next(iter(r.keys())) for r in rows]
+        formula_symbols = parse_formula(self.symbol)
+        if Counter(row_symbols) != Counter(formula_symbols):
+            raise ValueError(
+                f"Adsorbate '{self.symbol}': coordinates symbols "
+                f"{row_symbols} do not match formula composition "
+                f"{formula_symbols}"
+            )
+
+        if not (0 <= self.binding_index < len(rows)):
+            raise ValueError(
+                f"Adsorbate '{self.symbol}': binding_index={self.binding_index} "
+                f"out of range for {len(rows)} atoms"
+            )
         return self
 
 

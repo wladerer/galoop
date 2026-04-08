@@ -45,7 +45,7 @@ def minimal_config(cu_slab_path):
         "adsorbates": [
             {"symbol": "O",  "chemical_potential": -4.0, "min_count": 0, "max_count": 3},
             {"symbol": "OH", "chemical_potential": -3.5, "min_count": 0, "max_count": 2,
-             "coordinates": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.97]]},
+             "coordinates": [{"O": [0.0, 0.0, 0.0]}, {"H": [0.0, 0.0, 0.97]}]},
         ],
         "calculator_stages": [{"name": "preopt", "type": "mace"}],
         "ga": {

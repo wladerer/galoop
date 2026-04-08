@@ -31,12 +31,14 @@ class TestBuildParslConfig:
     def test_local_nworkers(self):
         from galoop.config import SchedulerConfig
         from galoop.engine.scheduler import build_parsl_config
-        from parsl.executors import ThreadPoolExecutor
+        from parsl.executors import HighThroughputExecutor
         sched = SchedulerConfig(type="local", nworkers=3)
         cfg = build_parsl_config(sched)
         executor = cfg.executors[0]
-        assert isinstance(executor, ThreadPoolExecutor)
-        assert executor.max_threads == 3
+        # Local now uses HTEX-over-LocalProvider so each MACE worker is its
+        # own process — ThreadPoolExecutor caused MACE calc state races.
+        assert isinstance(executor, HighThroughputExecutor)
+        assert executor.max_workers_per_node == 3
 
     def test_slurm_executor_label(self):
         from galoop.config import SchedulerConfig

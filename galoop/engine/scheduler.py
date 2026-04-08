@@ -143,7 +143,19 @@ def build_parsl_config(config, run_dir=None) -> Config:
                  resources.get("queue", "default"), nworkers)
 
     else:
-        executor = ThreadPoolExecutor(max_threads=nworkers, label="local")
-        log.info("Parsl executor: local  max_threads=%d", nworkers)
+        # HTEX over LocalProvider: each worker is its own process, so the
+        # MACE calculator (which is not thread-safe) gets a fresh per-process
+        # instance instead of being shared across threads.
+        executor = HighThroughputExecutor(
+            label="local",
+            worker_logdir_root=worker_log_dir,
+            max_workers_per_node=nworkers,
+            provider=LocalProvider(
+                init_blocks=1,
+                min_blocks=1,
+                max_blocks=1,
+            ),
+        )
+        log.info("Parsl executor: local HTEX  workers=%d", nworkers)
 
     return Config(executors=[executor], run_dir=parsl_run_dir)

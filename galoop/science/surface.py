@@ -88,7 +88,7 @@ def load_slab(
 def load_adsorbate(
     symbol: str,
     geometry: str | Path | None = None,
-    coordinates: list[list[float]] | None = None,
+    coordinates: list[dict[str, list[float]]] | None = None,
 ) -> Atoms:
     """
     Load or build an adsorbate :class:`Atoms` object.
@@ -105,16 +105,15 @@ def load_adsorbate(
         return read(str(p))
 
     if coordinates is not None:
-        coords = np.asarray(coordinates, dtype=float)
-        if coords.ndim == 1:
-            coords = coords.reshape(1, -1)
-        symbols = parse_formula(symbol)
-        if len(symbols) != len(coords):
-            raise ValueError(
-                f"Formula '{symbol}' has {len(symbols)} atoms but "
-                f"{len(coords)} coordinate rows were given"
-            )
-        return Atoms(symbols=symbols, positions=coords)
+        # New schema (validated in config.py): list of single-key dicts
+        # {symbol: [x,y,z]}.  Row order defines atom indices.
+        symbols: list[str] = []
+        positions: list[list[float]] = []
+        for row in coordinates:
+            (sym, pos), = row.items()
+            symbols.append(sym)
+            positions.append(pos)
+        return Atoms(symbols=symbols, positions=np.asarray(positions, dtype=float))
 
     elems = parse_formula(symbol)
     if len(elems) == 1:
@@ -305,7 +304,7 @@ def place_adsorbate(
     n_orientations: int = 1,
     binding_index: int = 0,
     rng: np.random.Generator | None = None,
-    clash_scale: float = 0.85,
+    clash_scale: float = 0.7,
     max_attempts: int = 50,
     n_slab_atoms: int = 0,
 ) -> Atoms:
@@ -379,7 +378,7 @@ def place_adsorbate(
     # (not above previously placed adsorbates)
     slab_top_z = slab.get_positions()[:n_slab_bare, 2].max()
     from ase.data import covalent_radii as _cov_rad
-    binding_z_offset = 1.8  # reasonable default for most adsorbate-metal bonds
+    binding_z_offset = 2.0  # reasonable default for most adsorbate-metal bonds
 
     for attempt in range(max_attempts):
         if attempt < len(sites):

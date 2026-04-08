@@ -448,10 +448,16 @@ def _build_initial_population(config, slab_info, store: GaloopStore, rng):
         for a in config.adsorbates
     }
 
+    # Stratified seeding: cycle target totals across [min_adsorbates, max_adsorbates]
+    # so the initial population spans every coverage level instead of biasing
+    # random draws toward the middle of the range.
+    lo, hi = config.ga.min_adsorbates, config.ga.max_adsorbates
+    coverage_levels = list(range(lo, hi + 1))
     for i in range(config.ga.population_size):
+        target_total = coverage_levels[i % len(coverage_levels)]
         counts = _random_stoichiometry(
             config.adsorbates, rng,
-            config.ga.min_adsorbates, config.ga.max_adsorbates,
+            target_total, target_total,
         )
 
         current = slab_info.atoms.copy()

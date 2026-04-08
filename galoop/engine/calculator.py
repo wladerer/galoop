@@ -177,6 +177,12 @@ class CalculatorStage:
                 "MACE requires mace-torch.  Install with: pip install mace-torch"
             ) from exc
         atoms = atoms.copy()
+        # Cached MACE calculator retains stale results from prior atoms of a
+        # different size — clear before reuse to avoid shape-mismatch errors.
+        try:
+            calc.results.clear()
+        except AttributeError:
+            pass
         atoms.calc = calc
 
         traj_path = stage_dir / "trajectory.traj"
