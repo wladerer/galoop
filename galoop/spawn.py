@@ -175,20 +175,25 @@ def fill_workers(
 ) -> bool:
     """Spawn offspring until the worker pool is full, submit via Parsl.
 
-    Returns True if any worker slot was filled; False if spawn exhausted
-    (hit max attempts with all candidates rejected as pre-relax duplicates
-    or operator failures).
+    Returns True if fill_workers produced a healthy batch, False if spawn
+    was exhausted — i.e. hit max_attempts before the pool was filled, meaning
+    most candidates were rejected as pre-relax duplicates or operator failures.
+    A "trickle" (submitted 1 slot but couldn't fill the rest) counts as
+    exhaustion so that spawn_stall_count in the main loop can accumulate and
+    eventually terminate runs stuck in a high-duplicate-rate regime.
     """
     limit = config.scheduler.nworkers
     max_attempts = limit * 5  # avoid infinite loop
     attempts = 0
     submitted = 0
+    exhausted = False
 
     while len(active_futures) < limit:
         if total_evals >= config.ga.max_structures:
             break
         if attempts >= max_attempts:
             log.debug("Hit max spawn attempts (%d), moving on", max_attempts)
+            exhausted = True
             break
 
         # GPR-guided spawning: with gpr_fraction probability, use GPR
@@ -243,7 +248,11 @@ def fill_workers(
         active_futures[new_ind.id] = fut
         submitted += 1
 
-    return submitted > 0
+    # Treat "hit max attempts before filling pool" as a stall signal, even if
+    # one or two slots trickled through. This lets the main loop's
+    # spawn_stall_count increment and eventually terminate runs where the
+    # duplicate rate is overwhelming forward progress.
+    return not exhausted and submitted > 0
 
 
 # ---------------------------------------------------------------------------

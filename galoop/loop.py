@@ -220,6 +220,10 @@ def run(
                     stall_count = 0
                 else:
                     stall_count += (total_evals - prev_evals)
+                # Reset spawn_stall_count on real forward progress (a new
+                # converged evaluation arrived), not merely on fill_workers
+                # managing to sneak a structure past the dup filter.
+                spawn_stall_count = 0
                 prev_evals = total_evals
 
                 # Retrain GPR when new data arrives
@@ -242,8 +246,9 @@ def run(
                 )
                 if not spawned and len(active_futures) < config.scheduler.nworkers:
                     spawn_stall_count += 1
-                else:
-                    spawn_stall_count = 0
+                # Note: do NOT reset spawn_stall_count on spawn success here;
+                # it's reset only when a new converged evaluation arrives
+                # (see the total_evals > prev_evals block above).
 
             log.info(
                 "Evals=%d  Best=%.4f eV  Stall=%d/%d  SpawnStall=%d/%d  Active=%d",
