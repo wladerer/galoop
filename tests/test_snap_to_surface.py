@@ -57,6 +57,7 @@ def _slab_config_pair():
         slab=SimpleNamespace(
             snap_z_min_offset=0.8,
             snap_z_max_offset=4.0,
+            snap_timeout_s=120.0,
         ),
     )
     return slab, cfg
@@ -189,3 +190,109 @@ class TestSnapUsesCachedCalc:
         # path stays consolidated through CalculatorStage.
         assert len(calls) == 3
         assert all(c == ("medium", "cpu", "float32") for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Per-structure timeout: wedged MACE must not freeze init-pop
+# ---------------------------------------------------------------------------
+
+class TestSnapTimeout:
+
+    def test_hung_bfgs_raises_snap_timeout_error(self, monkeypatch):
+        """A MACE calculator that wedges forever must be interrupted by
+        SIGALRM within the configured snap_timeout_s window."""
+        import time
+
+        slab, cfg = _slab_config_pair()
+        cfg.slab.snap_timeout_s = 0.5  # tight — test must be fast
+        n_slab = len(slab)
+        top = slab.positions[:, 2].max()
+        atoms = slab + Atoms("H", positions=[[0.0, 0.0, top + 2.0]])
+
+        class _HangingCalc(_FakeMaceCalc):
+            def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+                time.sleep(5.0)  # longer than snap_timeout_s
+
+        monkeypatch.setattr(
+            CalculatorStage, "_get_mace_calc",
+            classmethod(lambda cls, *a, **k: _HangingCalc()),
+        )
+
+        import pytest
+        t0 = time.monotonic()
+        with pytest.raises(spawn.SnapTimeoutError):
+            spawn.snap_to_surface(atoms, cfg, n_slab_atoms=n_slab)
+        elapsed = time.monotonic() - t0
+        # Should fire well before the 5s sleep would have finished.
+        assert elapsed < 2.0, f"timeout took {elapsed:.2f}s, expected < 2s"
+
+    def test_build_initial_population_honors_galoopstop(self, monkeypatch, tmp_path):
+        """Touching galoopstop mid-init-pop must stop before the next structure."""
+        from galoop import spawn as spawn_mod
+
+        # Let the loop run a couple structures then trip the sentinel.
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+
+        call_count = {"n": 0}
+        real_snap = spawn_mod.snap_to_surface
+
+        def counting_snap(atoms, cfg, n_slab_atoms):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                (run_dir / "galoopstop").touch()
+            return atoms
+
+        monkeypatch.setattr(spawn_mod, "snap_to_surface", counting_snap)
+
+        # Minimal stub store with just what build_initial_population touches.
+        class _StubStore:
+            def __init__(self, run_dir):
+                self.run_dir = run_dir
+                self.inserted = []
+
+            def insert(self, ind):
+                d = run_dir / "structures" / ind.id
+                d.mkdir(parents=True, exist_ok=True)
+                self.inserted.append(ind)
+                return d
+
+            def update(self, ind):
+                pass
+
+        # Build a minimal config/slab_info pair that build_random_structure accepts.
+        # Rather than wiring all that, patch build_random_structure to a no-op.
+        from ase.build import fcc111
+        stub_slab = fcc111("Cu", size=(2, 2, 3), vacuum=10.0, periodic=True)
+
+        monkeypatch.setattr(
+            spawn_mod, "build_random_structure",
+            lambda *a, **k: stub_slab.copy(),
+        )
+        monkeypatch.setattr(
+            spawn_mod, "load_ads_template_dict",
+            lambda ads: {"H": Atoms("H")},
+        )
+        monkeypatch.setattr(
+            spawn_mod, "random_stoichiometry",
+            lambda *a, **k: {"H": 1},
+        )
+
+        cfg = SimpleNamespace(
+            adsorbates=[SimpleNamespace(symbol="H")],
+            ga=SimpleNamespace(
+                population_size=10,
+                min_adsorbates=1,
+                max_adsorbates=3,
+            ),
+            slab=SimpleNamespace(snap_timeout_s=120.0),
+        )
+        slab_info = SimpleNamespace(n_slab_atoms=len(stub_slab))
+        store = _StubStore(run_dir)
+
+        import numpy as np
+        spawn_mod.build_initial_population(cfg, slab_info, store, np.random.default_rng(0))
+
+        # Should have stopped after the 2nd structure; not all 10 built.
+        assert call_count["n"] == 2
+        assert len(store.inserted) < 10

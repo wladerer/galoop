@@ -46,7 +46,20 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None:
-    """Spawn the initial GA population, stratified across coverage levels."""
+    """Spawn the initial GA population, stratified across coverage levels.
+
+    Honors the ``galoopstop`` sentinel file between structures for fast
+    abandonment: if the user touches galoopstop mid-init-pop, we stop at the
+    next iteration boundary and return whatever was built so far. Structures
+    whose ``snap_to_surface`` BFGS call exceeds ``config.slab.snap_timeout_s``
+    are skipped and not inserted into the store (so the population may end up
+    smaller than ``population_size``, which is fine — the main loop proceeds
+    with whatever it gets).
+    """
+    from galoop.loop import _stop_requested
+
+    run_dir = store.run_dir
+
     ads_atoms = load_ads_template_dict(config.adsorbates)
 
     # Stratified seeding: cycle target totals across [min_adsorbates, max_adsorbates]
@@ -54,7 +67,15 @@ def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None
     # random draws toward the middle of the range.
     lo, hi = config.ga.min_adsorbates, config.ga.max_adsorbates
     coverage_levels = list(range(lo, hi + 1))
+    built = 0
     for i in range(config.ga.population_size):
+        if _stop_requested(run_dir):
+            log.info(
+                "Stop requested during init-pop at structure %d/%d — abandoning",
+                i, config.ga.population_size,
+            )
+            break
+
         target_total = coverage_levels[i % len(coverage_levels)]
         counts = random_stoichiometry(
             config.adsorbates, rng, target_total, target_total,
@@ -72,8 +93,18 @@ def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None
                 slab_info, config.adsorbates, ads_atoms, counts, rng,
             )
 
-        # Quick constrained pre-relax: let adsorbates settle toward surface
-        current = snap_to_surface(current, config, slab_info.n_slab_atoms)
+        # Quick constrained pre-relax: let adsorbates settle toward surface.
+        # Wrapped in a per-structure wall-clock timeout so a single hung MACE
+        # BFGS call can't freeze the whole init-pop phase (see FINDINGS.md
+        # cycle 4a).
+        try:
+            current = snap_to_surface(current, config, slab_info.n_slab_atoms)
+        except SnapTimeoutError as exc:
+            log.warning(
+                "structure_%05d: snap_to_surface timed out after %.1fs — skipping",
+                i, exc.timeout_s,
+            )
+            continue
 
         ind = Individual.from_init(extra_data={"adsorbate_counts": dict(counts)})
         struct_dir = store.insert(ind)
@@ -81,9 +112,50 @@ def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None
         write(str(poscar), current, format="vasp")
         ind.geometry_path = str(poscar)
         store.update(ind)
+        built += 1
         log.debug("initial structure %05d: %s", i, dict(counts))
 
-    log.info("Initial population: %d structures", config.ga.population_size)
+    log.info("Initial population: %d structures", built)
+
+
+class SnapTimeoutError(RuntimeError):
+    """Raised when snap_to_surface's BFGS call exceeds the per-structure timeout."""
+
+    def __init__(self, timeout_s: float):
+        super().__init__(f"snap_to_surface exceeded {timeout_s:.1f}s timeout")
+        self.timeout_s = timeout_s
+
+
+import contextlib
+import signal
+import threading
+
+
+@contextlib.contextmanager
+def _snap_timeout(timeout_s: float):
+    """SIGALRM-based wall-clock timeout for snap_to_surface's BFGS call.
+
+    Only active on the main thread of the main interpreter — SIGALRM cannot
+    be delivered elsewhere. On non-main threads (e.g. under pytest-xdist or
+    from a worker) this silently no-ops rather than raising, since the
+    expected deployment path is synchronous init-pop on the main thread.
+    """
+    on_main_thread = threading.current_thread() is threading.main_thread()
+    if not on_main_thread or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _handler(signum, frame):
+        raise SnapTimeoutError(timeout_s)
+
+    # itimer lets us pass float seconds; SIGALRM's plain alarm() is integer-only.
+    old_handler = signal.signal(signal.SIGALRM, _handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_s)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +199,21 @@ def snap_to_surface(
     work.calc = calc
     work.set_constraint(FixAtoms(indices=list(range(n_slab_atoms))))
 
-    # Short BFGS: adsorbates relax toward surface binding sites
+    # Short BFGS: adsorbates relax toward surface binding sites.
+    # Guarded by a SIGALRM-based wall-clock timeout so a single hung MACE
+    # forward pass (e.g. CUDA stall) can't freeze init-pop. The timeout
+    # default (120s) assumes MACE; raise config.slab.snap_timeout_s if you
+    # ever point snap at DFT.
+    timeout_s = float(getattr(config.slab, "snap_timeout_s", 120.0))
     try:
-        dyn = BFGS(work, logfile=None)
-        dyn.run(fmax=0.2, steps=30)
+        with _snap_timeout(timeout_s):
+            dyn = BFGS(work, logfile=None)
+            dyn.run(fmax=0.2, steps=30)
+    except SnapTimeoutError:
+        # Propagate to caller so build_initial_population can skip this
+        # structure entirely rather than silently returning clamp-only
+        # geometry for something that hung.
+        raise
     except Exception as exc:
         # If BFGS fails, still clamp z and return — but log so we can spot
         # systemic failures (e.g. CUDA OOM) rather than silently degrading

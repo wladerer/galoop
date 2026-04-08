@@ -33,6 +33,14 @@ class SlabConfig(BaseModel):
         default=4.0, gt=0.0,
         description="Maximum z above slab top after snap-to-surface (Å)",
     )
+    snap_timeout_s: float = Field(
+        default=120.0, gt=0.0,
+        description=(
+            "Per-structure wall-clock timeout (seconds) for snap_to_surface's "
+            "BFGS call. snap uses MACE by construction, so 120s is 'something "
+            "is clearly wrong'. If you ever point snap at DFT, raise this."
+        ),
+    )
     placement_clash_scale: float = Field(
         default=0.7, gt=0.0,
         description=(
