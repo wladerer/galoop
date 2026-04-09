@@ -17,14 +17,14 @@ per-run REPORT.md is uncommitted (lives next to the run dir, which is
 |---:|---------------------|-------------|-------------------------|---------------------|-------------|------------:|----------------------------|--------|
 |  1 | cu111_co_camp       | Cu(111)     | CO/H/H₂O                | U=0,  pH=0          | done        |  −397.640   | CO:8 H:3 H₂O:0 (ceiling)   | 17 min |
 |  2 | cu100_co_camp       | Cu(100)     | CO/H/H₂O                | U=0,  pH=0          | done†       |  −450.106   | CO:8 H:1 H₂O:2 (ceiling)   | 67 min |
-|  3 | cu211_co_camp       | Cu(211)     | CO/H/H₂O                | U=0,  pH=0          | running     |     —       | —                          |  —     |
-|  4 | (Pt(111) ORR)       | Pt(111)     | O/OH/OOH/H              | U=0.8, pH=0         | planned     |     —       | —                          |  —     |
-|  5 | (Pt(211) NRR)       | Pt(211)     | N/NH/NH₂/NH₃/H          | U=−0.5, pH=0        | planned     |     —       | —                          |  —     |
-|  6 | (Ag(111) CO)        | Ag(111)     | CO/H/H₂O                | U=0,  pH=0          | planned     |     —       | —                          |  —     |
-|  7 | (Pd(111) H sat)     | Pd(111)     | H (max=16)              | U=0,  pH=0          | planned     |     —       | —                          |  —     |
-|  8 | (Ni(111) CHₓ)       | Ni(111)     | C/CH/CH₂/CH₃/H          | U=0,  pH=0          | planned     |     —       | —                          |  —     |
-|  9 | (Au(111) inert)     | Au(111)     | CO/OH                   | U=0,  pH=0          | planned     |     —       | —                          |  —     |
-| 10 | (Ru(0001) hcp)      | Ru(0001)    | H₂O/OH/O                | U=0,  pH=0          | planned     |     —       | —                          |  —     |
+|  3 | cu211_co_camp       | Cu(211)     | CO/H/H₂O                | U=0,  pH=0          | done‡       |  −435.784   | CO:9\* H:1 H₂O:2 (bug 9)   | 19 min |
+|  4 | pt111_orr_camp      | Pt(111)     | O/OH/OOH/H              | U=0.8, pH=0         | running     |     —       | —                          |  —     |
+|  5 | pt211_nrr_camp      | Pt(211)     | N/NH/NH₂/NH₃/H          | U=−0.5, pH=0        | queued      |     —       | —                          |  —     |
+|  6 | ag111_co_camp       | Ag(111)     | CO/H/H₂O                | U=0,  pH=0          | queued      |     —       | —                          |  —     |
+|  7 | pd111_hsat_camp     | Pd(111)     | H (max=16)              | U=0,  pH=0          | queued      |     —       | —                          |  —     |
+|  8 | ni111_chx_camp      | Ni(111)     | C/CH/CH₂/CH₃/H          | U=0,  pH=0          | queued      |     —       | —                          |  —     |
+|  9 | au111_co_camp       | Au(111)     | CO/OH                   | U=0,  pH=0          | queued      |     —       | —                          |  —     |
+| 10 | ru0001_oh_camp      | Ru(0001)    | H₂O/OH/O                | U=0,  pH=0          | queued      |     —       | —                          |  —     |
 
 ## Bugs found / fixed during the run
 
@@ -37,11 +37,20 @@ per-run REPORT.md is uncommitted (lives next to the run dir, which is
 | 6 | tuning   | high pre-relax dup rate + early spawn stall on tight `max_count`                              | mitigated by raising `max_count`, lowering `duplicate_threshold` to 0.88 |
 | 7 | tuning   | `max_stall: 40` is too patient when convergence rate drops to ~1/12 min late in a run        | will use `max_stall: 15` for runs 4–10 to fail fast |
 | 8 | tuning   | `max_count: 8` for CO is hit on every Cu facet → saturation point not measurable             | will raise to `max_count: 14` for runs 4+ where it makes sense |
+| 9 | **real** | `spawn_one` crossover bounds check enforces only `max_adsorbates` (total), NOT per-species `max_count`. Splice/merge of two parents at the CO ceiling can emit children exceeding it.  | fixed `a6a0fb9` (per-species min/max enforcement in `_TWO_PARENT_OPS` branch) |
+|10 | env      | `fairchem-core` install bumped torch 2.6→2.8 but left `torchvision==0.21` (torch 2.6 era). `torchvision::nms` import fails; anything importing through `galoop.spawn`→MACE→e3nn also fails with `e3nn` codegen pickling mismatch. | workaround: upgraded torchvision to 0.23.0+cu128 (fixes torchvision). `e3nn`/MACE chain still broken in test env — NOT blocking UMA runtime. Long-term fix: pin e3nn ≥ torch-2.8-compat or strip MACE tests from default ignore list. |
 | - | note     | bug 4 (`parsl.dfk().cleanup()`) validated end-to-end on Cu(100) — `galoopstop` triggered a clean exit with `DFK cleanup complete` and no hang |  |
 
 † Cu(100) was stopped early via `galoopstop` after 67 min (24 converged,
 85% dup rate, best unchanged for ~45 min). The run produced a useful
 result; further evaluation would have been a poor use of GPU time.
+
+‡ Cu(211) winner violated configured `max_count=6` for CO (hit 9 and
+10). The relaxations are physically valid but the run doesn't answer
+the "what's CO coverage at max_count=6" question. Flagged in
+`runs/cu211_co_camp/REPORT.md`; fix landed as commit `a6a0fb9`; not
+re-run as the result is still a useful data point showing UMA
+accommodates higher CO coverage on stepped surfaces.
 
 (snap_to_surface ablation findings from 2026-04-08 are intentionally
 not committed to this index — the snap removal was rolled back, the
