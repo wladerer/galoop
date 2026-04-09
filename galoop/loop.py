@@ -264,9 +264,13 @@ def run(
                     store.update(ind)
 
         try:
+            parsl.dfk().cleanup()
+        except Exception as exc:
+            log.debug("Parsl dfk cleanup: %s", exc)
+        try:
             parsl.clear()
         except Exception as exc:
-            log.debug("Parsl cleanup: %s", exc)
+            log.debug("Parsl clear: %s", exc)
 
         try:
             store.close()
