@@ -44,15 +44,28 @@ class SlabInfo(NamedTuple):
 def _surface_normal(atoms: Atoms) -> np.ndarray:
     """Return the unit vector normal to the surface.
 
-    Derived from the cell's c-vector (third lattice vector), which points along
-    the vacuum/stacking direction by ASE convention.  Falls back to [0,0,1] for
-    degenerate cells (zero-length c).
+    Computed as the normalised cross product of the in-plane lattice vectors
+    ``a`` and ``b`` (``cell[0] × cell[1]``), which is perpendicular to the
+    surface plane by construction — even for non-orthogonal cells where the
+    c-vector is tilted (e.g. ASE ``fcc211``, or any stepped slab built with
+    ``ase.build.surface``).
+
+    The sign is chosen so the normal points into the vacuum side (the same
+    half-space as the c-vector), giving ``[0, 0, 1]`` for the usual
+    orthogonal slab convention. Falls back to ``[0, 0, 1]`` for degenerate
+    cells where ``a × b`` vanishes.
     """
-    c = np.asarray(atoms.cell[2], dtype=float)
-    norm = np.linalg.norm(c)
+    cell = np.asarray(atoms.cell, dtype=float)
+    a, b, c = cell[0], cell[1], cell[2]
+    n = np.cross(a, b)
+    norm = np.linalg.norm(n)
     if norm < 1e-10:
         return np.array([0.0, 0.0, 1.0])
-    return c / norm
+    n = n / norm
+    # Point toward the vacuum side (same half-space as c).
+    if np.dot(n, c) < 0:
+        n = -n
+    return n
 
 
 def _surface_normal_from_slab_info(slab_info: "SlabInfo") -> np.ndarray:
