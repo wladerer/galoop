@@ -16,8 +16,8 @@ per-run REPORT.md is uncommitted (lives next to the run dir, which is
 | #  | tag                 | metal/facet | adsorbates              | conditions          | status      | best G (eV) | top ads counts             | wall   |
 |---:|---------------------|-------------|-------------------------|---------------------|-------------|------------:|----------------------------|--------|
 |  1 | cu111_co_camp       | Cu(111)     | CO/H/H₂O                | U=0,  pH=0          | done        |  −397.640   | CO:8 H:3 H₂O:0 (ceiling)   | 17 min |
-|  2 | cu100_co_camp       | Cu(100)     | CO/H/H₂O                | U=0,  pH=0          | running     |     —       | —                          |  —     |
-|  3 | cu211_co_camp       | Cu(211)     | CO/H/H₂O                | U=0,  pH=0          | queued      |     —       | —                          |  —     |
+|  2 | cu100_co_camp       | Cu(100)     | CO/H/H₂O                | U=0,  pH=0          | done†       |  −450.106   | CO:8 H:1 H₂O:2 (ceiling)   | 67 min |
+|  3 | cu211_co_camp       | Cu(211)     | CO/H/H₂O                | U=0,  pH=0          | running     |     —       | —                          |  —     |
 |  4 | (Pt(111) ORR)       | Pt(111)     | O/OH/OOH/H              | U=0.8, pH=0         | planned     |     —       | —                          |  —     |
 |  5 | (Pt(211) NRR)       | Pt(211)     | N/NH/NH₂/NH₃/H          | U=−0.5, pH=0        | planned     |     —       | —                          |  —     |
 |  6 | (Ag(111) CO)        | Ag(111)     | CO/H/H₂O                | U=0,  pH=0          | planned     |     —       | —                          |  —     |
@@ -35,6 +35,13 @@ per-run REPORT.md is uncommitted (lives next to the run dir, which is
 | 1 | medium   | `_surface_normal` used `c/|c|`; wrong for tilted-c cells (the very case the commit named)    | fixed `d5e5687` (a×b normal); not yet stress-tested |
 | 4 | minor    | `parsl.dfk().cleanup()` not called on exit → "DFK still running" hang                         | fixed `0a22b65`                               |
 | 6 | tuning   | high pre-relax dup rate + early spawn stall on tight `max_count`                              | mitigated by raising `max_count`, lowering `duplicate_threshold` to 0.88 |
+| 7 | tuning   | `max_stall: 40` is too patient when convergence rate drops to ~1/12 min late in a run        | will use `max_stall: 15` for runs 4–10 to fail fast |
+| 8 | tuning   | `max_count: 8` for CO is hit on every Cu facet → saturation point not measurable             | will raise to `max_count: 14` for runs 4+ where it makes sense |
+| - | note     | bug 4 (`parsl.dfk().cleanup()`) validated end-to-end on Cu(100) — `galoopstop` triggered a clean exit with `DFK cleanup complete` and no hang |  |
+
+† Cu(100) was stopped early via `galoopstop` after 67 min (24 converged,
+85% dup rate, best unchanged for ~45 min). The run produced a useful
+result; further evaluation would have been a poor use of GPU time.
 
 (snap_to_surface ablation findings from 2026-04-08 are intentionally
 not committed to this index — the snap removal was rolled back, the
