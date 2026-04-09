@@ -359,7 +359,14 @@ class Pipeline:
         except Exception as exc:
             log.warning("Failed to write final CONTCAR: %s", exc)
 
-        last_stage_name = self.stages[-1].name
+        if not stage_results:
+            return {
+                "converged": False,
+                "final_energy": None,
+                "stage_results": stage_results,
+                "final_atoms": current_atoms,
+            }
+        last_stage_name = list(stage_results.keys())[-1]
         final_energy = stage_results[last_stage_name].energy
         energy_file = struct_dir / "FINAL_ENERGY"
         try:

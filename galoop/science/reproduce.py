@@ -359,12 +359,17 @@ def mutate_translate(
 
     mol = molecules[int(rng.integers(len(molecules)))]
 
+    from galoop.science.surface import _surface_normal, find_surface_sites
+
     base_pos = atoms.get_positions()
-    current_xy = base_pos[mol][:, :2].mean(axis=0)
+    n_hat = _surface_normal(atoms)
+
+    # In-plane position of the molecule: project out the surface-normal component
+    mol_pos = base_pos[mol]
+    current_inplane = (mol_pos - np.outer(mol_pos @ n_hat, n_hat)).mean(axis=0)
 
     try:
-        from galoop.science.surface import find_surface_sites
-        sites = find_surface_sites(atoms, n_slab)
+        sites = find_surface_sites(atoms, n_slab, normal=n_hat)
     except Exception as exc:
         log.debug("find_surface_sites failed in mutate_translate: %s", exc)
         sites = []
@@ -379,17 +384,21 @@ def mutate_translate(
         return child
 
     if sites:
+        # Project sites to in-plane (strip normal component), compute distances
         sites_arr = np.array(sites)
-        dists = np.linalg.norm(sites_arr - current_xy, axis=1)
-        far_sites = sites_arr[dists > 2.0]
+        sites_inplane = sites_arr - np.outer(sites_arr @ n_hat, n_hat)
+        dists = np.linalg.norm(sites_inplane - current_inplane, axis=1)
+        far_sites = sites_inplane[dists > 2.0]
         if len(far_sites) == 0:
-            far_sites = sites_arr
+            far_sites = sites_inplane
         rng.shuffle(far_sites)
 
-        for target_xy in far_sites[:max_attempts]:
-            jitter = rng.normal(0, 0.3, size=2)
-            delta_xy = (target_xy - current_xy) + jitter
-            delta = np.array([delta_xy[0], delta_xy[1], rng.normal(0, displacement * 0.3)])
+        for target_inplane in far_sites[:max_attempts]:
+            jitter = rng.normal(0, 0.3, size=3)
+            jitter -= (jitter @ n_hat) * n_hat  # keep jitter in-plane
+            delta_inplane = (target_inplane - current_inplane) + jitter
+            # Small random displacement along the normal (was z jitter before)
+            delta = delta_inplane + rng.normal(0, displacement * 0.3) * n_hat
             trial = _build_child(delta)
             # Reject if the translated molecule clashes with anything else
             if not check_clash(trial, n_slab=n_slab, scale=0.7):

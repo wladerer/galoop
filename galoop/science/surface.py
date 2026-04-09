@@ -34,6 +34,32 @@ class SlabInfo(NamedTuple):
     snap_z_min_offset: float = 0.8
     snap_z_max_offset: float = 4.0
     placement_clash_scale: float = 0.7
+    normal: np.ndarray | None = None  # unit surface-normal vector (along c); None → [0,0,1]
+
+
+# ---------------------------------------------------------------------------
+# Surface normal
+# ---------------------------------------------------------------------------
+
+def _surface_normal(atoms: Atoms) -> np.ndarray:
+    """Return the unit vector normal to the surface.
+
+    Derived from the cell's c-vector (third lattice vector), which points along
+    the vacuum/stacking direction by ASE convention.  Falls back to [0,0,1] for
+    degenerate cells (zero-length c).
+    """
+    c = np.asarray(atoms.cell[2], dtype=float)
+    norm = np.linalg.norm(c)
+    if norm < 1e-10:
+        return np.array([0.0, 0.0, 1.0])
+    return c / norm
+
+
+def _surface_normal_from_slab_info(slab_info: "SlabInfo") -> np.ndarray:
+    """Return the surface normal, preferring the cached value in *slab_info*."""
+    if slab_info.normal is not None:
+        return slab_info.normal
+    return _surface_normal(slab_info.atoms)
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +144,14 @@ def load_slab(
             "Add selective dynamics (T/F flags) to freeze bulk layers."
         )
 
+    normal = _surface_normal(atoms)
+    angle_from_z = np.degrees(np.arccos(np.clip(abs(normal[2]), 0.0, 1.0)))
+    if angle_from_z > 1.0:
+        log.info(
+            "Surface normal is %.2f° from z-axis — using n̂=%s for height projections",
+            angle_from_z, np.round(normal, 4),
+        )
+
     return SlabInfo(
         atoms=atoms,
         n_slab_atoms=n_slab,
@@ -128,6 +162,7 @@ def load_slab(
         snap_z_min_offset=snap_z_min_offset,
         snap_z_max_offset=snap_z_max_offset,
         placement_clash_scale=placement_clash_scale,
+        normal=normal,
     )
 
 
@@ -298,19 +333,24 @@ def _rotation_to(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return np.eye(3) + vx + vx @ vx / (1.0 + c)
 
 
-def orient_upright(adsorbate: Atoms, binding_index: int = 0) -> Atoms:
+def orient_upright(
+    adsorbate: Atoms,
+    binding_index: int = 0,
+    normal: np.ndarray | None = None,
+) -> Atoms:
     """
     Return a copy of *adsorbate* rotated so that the atom at *binding_index*
-    points toward the surface (−z direction).
+    points toward the surface (along -normal direction).
 
     For a single-atom adsorbate this is a no-op.  For multi-atom species
-    the molecule is rotated so the binding atom sits at minimum z, ready
-    to adsorb.
+    the molecule is rotated so the binding atom sits at the lowest point
+    along the surface normal, ready to adsorb.
 
     Parameters
     ----------
     adsorbate     : molecule to orient
     binding_index : index of the atom that binds to the surface (default 0)
+    normal        : unit surface-normal vector; defaults to [0, 0, 1]
 
     Examples
     --------
@@ -327,6 +367,8 @@ def orient_upright(adsorbate: Atoms, binding_index: int = 0) -> Atoms:
             f"{len(adsorbate)} atoms"
         )
 
+    n = np.array([0.0, 0.0, 1.0]) if normal is None else np.asarray(normal, dtype=float)
+
     ads = adsorbate.copy()
     pos = ads.get_positions()
     com = ads.get_center_of_mass()
@@ -336,7 +378,7 @@ def orient_upright(adsorbate: Atoms, binding_index: int = 0) -> Atoms:
     if norm < 1e-10:
         return ads      # binding atom coincides with COM — nothing to do
 
-    rot = _rotation_to(v / norm, np.array([0.0, 0.0, -1.0]))
+    rot = _rotation_to(v / norm, -n)
     ads.set_positions((pos - com) @ rot.T + com)
     return ads
 
@@ -349,46 +391,53 @@ def find_surface_sites(
     slab: Atoms,
     n_slab: int,
     bond_mult: float = 1.0,
+    normal: np.ndarray | None = None,
 ) -> list[np.ndarray]:
     """Identify atop, bridge, and hollow sites on the top surface layer.
 
-    Returns a list of (x, y) positions where adsorbates can bind.
+    Returns a list of 3D Cartesian positions for candidate adsorption sites.
+    Heights are measured along the surface normal (c-vector direction), not
+    along the Cartesian z-axis, so this works for tilted/non-orthogonal cells.
 
-    Strategy: find the top-layer slab atoms, then generate atop (directly
-    above each atom), bridge (midpoint of bonded pairs), and hollow
-    (centroid of bonded triangles) sites.
+    Parameters
+    ----------
+    slab      : slab Atoms (bare or with previously placed adsorbates)
+    n_slab    : number of atoms belonging to the bare slab
+    bond_mult : multiplier on covalent radii to detect nearest-neighbour pairs
+    normal    : unit surface-normal vector; derived from slab cell if None
     """
     from ase.data import covalent_radii
 
-    pos = slab.get_positions()[:n_slab]
-    z_coords = pos[:, 2]
-    z_top = z_coords.max()
+    n = _surface_normal(slab) if normal is None else np.asarray(normal, dtype=float)
 
-    # Top-layer atoms: within 1.0 Å of the highest z
-    top_mask = z_coords > z_top - 1.0
+    pos = slab.get_positions()[:n_slab]
+    heights = pos @ n
+    h_top = heights.max()
+
+    # Top-layer atoms: within 1.0 Å of the highest point along the normal
+    top_mask = heights > h_top - 1.0
     top_indices = np.where(top_mask)[0]
     top_pos = pos[top_indices]
 
     sites: list[np.ndarray] = []
 
-    # Atop sites
+    # Atop sites — full 3D position of each top-layer atom
     for p in top_pos:
-        sites.append(p[:2].copy())
+        sites.append(p.copy())
 
-    # Find bonded pairs in the top layer (nearest-neighbor distance)
+    # Find bonded pairs in the top layer (nearest-neighbour distance)
     nums = slab.get_atomic_numbers()
     for i in range(len(top_indices)):
         for j in range(i + 1, len(top_indices)):
             ii, jj = top_indices[i], top_indices[j]
             cutoff = bond_mult * (covalent_radii[nums[ii]] + covalent_radii[nums[jj]])
-            # Use MIC for periodic distance
             d = slab.get_distance(ii, jj, mic=True)
-            if d < cutoff * 1.5:  # within ~1.5x bond length = nearest neighbors
-                # Bridge site: midpoint (in Cartesian, approximating PBC)
-                mid = 0.5 * (pos[ii][:2] + pos[jj][:2])
+            if d < cutoff * 1.5:
+                # Bridge site: midpoint (Cartesian, PBC approximation)
+                mid = 0.5 * (pos[ii] + pos[jj])
                 sites.append(mid)
 
-    # Hollow sites: centroids of triangles formed by bonded triplets
+    # Hollow sites: centroids of bonded triangles
     for i in range(len(top_indices)):
         for j in range(i + 1, len(top_indices)):
             for k in range(j + 1, len(top_indices)):
@@ -402,7 +451,7 @@ def find_surface_sites(
                     covalent_radii[nums[ii]] + covalent_radii[nums[kk]],
                 ) * bond_mult * 1.5
                 if d_ij < max_cut and d_jk < max_cut and d_ik < max_cut:
-                    centroid = (pos[ii][:2] + pos[jj][:2] + pos[kk][:2]) / 3
+                    centroid = (pos[ii] + pos[jj] + pos[kk]) / 3
                     sites.append(centroid)
 
     return sites
@@ -448,32 +497,38 @@ def place_adsorbate(
     if rng is None:
         rng = np.random.default_rng()
 
-    # Orient the binding atom toward the surface before placement.
-    adsorbate = orient_upright(adsorbate, binding_index=binding_index)
+    # Surface normal: derived from cell, not assumed to be z.
+    n = _surface_normal(slab)
+
+    # Orient the binding atom toward the surface (along -n) before placement.
+    adsorbate = orient_upright(adsorbate, binding_index=binding_index, normal=n)
 
     cell = slab.get_cell()
     n_slab_before = len(slab)
 
     # Use the bare slab atom count for site identification and height reference.
-    # n_slab_atoms is the original slab size (excludes previously placed adsorbates).
     n_slab_bare = n_slab_atoms if n_slab_atoms > 0 else n_slab_before
 
-    sites = find_surface_sites(slab, n_slab_bare)
+    sites = find_surface_sites(slab, n_slab_bare, normal=n)
 
     # Sort sites so the most isolated ones (farthest from existing adsorbates)
     # are tried first.  This spreads adsorbates across the surface.
+    # In-plane distance: project out the normal component, then compute MIC distance.
     if sites and len(slab) > n_slab_bare:
-        ads_xy = slab.get_positions()[n_slab_bare:, :2]
-        def _min_dist_to_existing(site_xy):
-            diffs = ads_xy - site_xy
-            # Minimum image in fractional coordinates for PBC
-            frac = np.linalg.solve(cell[:2, :2].T, diffs.T).T
+        ads_pos = slab.get_positions()[n_slab_bare:]
+        # In-plane positions: subtract normal component
+        ads_inplane = ads_pos - np.outer(ads_pos @ n, n)
+
+        def _min_inplane_dist(site_3d: np.ndarray) -> float:
+            site_inplane = site_3d - (site_3d @ n) * n
+            diffs = ads_inplane - site_inplane
+            # Minimum image convention using full 3D cell
+            frac = np.linalg.solve(cell.T, diffs.T).T
             frac -= np.round(frac)
-            cart = frac @ cell[:2, :2]
-            return np.min(np.linalg.norm(cart, axis=1))
-        sites.sort(key=_min_dist_to_existing, reverse=True)
-        # Add some randomness: shuffle within distance tiers so we don't
-        # always pick the exact same site
+            cart = frac @ cell
+            return float(np.min(np.linalg.norm(cart, axis=1)))
+
+        sites.sort(key=_min_inplane_dist, reverse=True)
         tier_size = max(3, len(sites) // 5)
         for start in range(0, len(sites), tier_size):
             end = min(start + tier_size, len(sites))
@@ -485,34 +540,43 @@ def place_adsorbate(
 
     combined = slab.copy()  # initialise so the variable is always bound
 
-    # Binding height: place binding atom *binding_z_offset* Å above the actual
-    # slab top (not above previously placed adsorbates)
-    slab_top_z = slab.get_positions()[:n_slab_bare, 2].max()
+    # Binding height: place COM *binding_z_offset* Å above the actual slab top
+    # measured along the surface normal (not Cartesian z).
+    slab_pos = slab.get_positions()[:n_slab_bare]
+    slab_top_h = float((slab_pos @ n).max())
 
     for attempt in range(max_attempts):
         if attempt < len(sites):
-            # Site-aware placement: use identified surface site
-            xy = sites[attempt]
-            z = slab_top_z + binding_z_offset + rng.uniform(-0.2, 0.3)
+            # Site-aware: strip the site's normal component and re-add the
+            # desired height, so the adsorbate lands at the right height
+            # regardless of the site atom's own height.
+            site = sites[attempt]
+            site_inplane = site - (site @ n) * n
+            h = slab_top_h + binding_z_offset + rng.uniform(-0.2, 0.3)
+            target = site_inplane + h * n
         else:
-            # Fallback: random (x, y) in unit cell, random z in window
-            frac_xy = rng.uniform(0, 1, size=2)
-            xy = frac_xy @ cell[:2, :2]
-            z = rng.uniform(zmin, zmax)
+            # Fallback: random in-plane position + random height in window
+            frac = rng.uniform(0, 1, size=3)
+            frac[2] = 0.0
+            inplane = frac @ cell  # a random in-plane point
+            inplane = inplane - (inplane @ n) * n
+            h = rng.uniform(zmin, zmax)
+            target = inplane + h * n
 
-        # Random rotation around the surface normal (z)
+        # Random rotation around the surface normal through the adsorbate COM
         angle = rng.uniform(0, 2 * np.pi)
+        c_a, s_a = np.cos(angle), np.sin(angle)
+        # Rodrigues' rotation matrix around n
+        nx, ny, nz = n
+        K = np.array([[0, -nz, ny], [nz, 0, -nx], [-ny, nx, 0]], dtype=float)
+        rot = c_a * np.eye(3) + s_a * K + (1 - c_a) * np.outer(n, n)
 
         ads = adsorbate.copy()
         com = ads.get_center_of_mass()
-        ads.translate([xy[0] - com[0], xy[1] - com[1], z - com[2]])
-
-        # Rotate around z through the new centre of mass
-        pos = ads.get_positions() - ads.get_center_of_mass()
-        c, s = np.cos(angle), np.sin(angle)
-        rot = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=float)
-        pos = pos @ rot.T + ads.get_center_of_mass()
-        ads.set_positions(pos)
+        # Translate COM to target, then rotate around n through target
+        ads.translate(target - com)
+        new_com = ads.get_center_of_mass()
+        ads.set_positions((ads.get_positions() - new_com) @ rot.T + new_com)
 
         combined = slab.copy()
         combined.extend(ads)
@@ -589,14 +653,16 @@ def detect_desorption(
     z_threshold : Å above which an adsorbate is considered desorbed.
                   Defaults to ``slab_info.zmax + 0.5``.
     """
+    n = _surface_normal_from_slab_info(slab_info)
+
     if z_threshold is None:
         z_threshold = slab_info.zmax + 3.0
 
     if len(atoms) <= slab_info.n_slab_atoms:
         return False
 
-    ads_z = atoms.get_positions()[slab_info.n_slab_atoms:, 2]
-    return bool(np.any(ads_z > z_threshold))
+    ads_heights = atoms.get_positions()[slab_info.n_slab_atoms:] @ n
+    return bool(np.any(ads_heights > z_threshold))
 
 
 def validate_surface_binding(

@@ -211,3 +211,44 @@ def _vasp_factory(params: dict) -> ASECalculator:
 
 register("mace", _mace_factory, drives_own_relaxation=False)
 register("vasp", _vasp_factory, drives_own_relaxation=True)
+
+
+# ---------------------------------------------------------------------------
+# Built-in: CHGNet
+# ---------------------------------------------------------------------------
+
+_chgnet_cache: dict[tuple, Any] = {}
+_chgnet_lock = threading.Lock()
+
+
+def _chgnet_factory(params: dict) -> ASECalculator:
+    """Return a CHGNet ASE calculator, memoized on (model_path, device).
+
+    ``params`` keys:
+        model   — path to a .pt.gz checkpoint, or omit for the bundled default
+        device  — 'cpu' / 'cuda' / 'auto'
+    """
+    model_path = params.get("model")
+    device = params.get("device", "cpu")
+    if device == "auto":
+        import torch as _torch
+        device = "cuda" if _torch.cuda.is_available() else "cpu"
+
+    key = (model_path, device)
+    if key in _chgnet_cache:
+        return _chgnet_cache[key]
+
+    with _chgnet_lock:
+        if key in _chgnet_cache:
+            return _chgnet_cache[key]
+
+        from chgnet.model import CHGNet
+        from chgnet.model.dynamics import CHGNetCalculator
+
+        model = CHGNet.from_file(model_path) if model_path else CHGNet.load()
+        calc = CHGNetCalculator(model=model, use_device=device)
+        _chgnet_cache[key] = calc
+        return calc
+
+
+register("chgnet", _chgnet_factory, drives_own_relaxation=False)
