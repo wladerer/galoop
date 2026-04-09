@@ -522,7 +522,12 @@ def spawn_one(store: GaloopStore, config, slab_info, rng,
             pair_key = frozenset(p.id for p in parents)
             pair_counts[pair_key] = pair_counts.get(pair_key, 0) + 1
 
-        # Bounds check for crossover operators
+        # Bounds check for crossover operators. Both splice and merge can
+        # produce children that violate either (a) the total
+        # min/max_adsorbates envelope or (b) an individual species'
+        # max_count ceiling — a splice of two parents each at CO=max_count
+        # can yield a child with CO > max_count as long as the total stays
+        # below max_adsorbates. Reject such children.
         if op in _TWO_PARENT_OPS:
             trial_counts = infer_adsorbate_counts(
                 child.get_chemical_symbols()[slab_info.n_slab_atoms:],
@@ -531,6 +536,11 @@ def spawn_one(store: GaloopStore, config, slab_info, rng,
             total = sum(trial_counts.values())
             if total > config.ga.max_adsorbates or total < config.ga.min_adsorbates:
                 return None
+            for a in config.adsorbates:
+                if trial_counts.get(a.symbol, 0) > a.max_count:
+                    return None
+                if trial_counts.get(a.symbol, 0) < a.min_count:
+                    return None
 
         if op in _PRESERVE_PARENT_COUNTS_OPS:
             ads_counts = parents[0].extra_data.get("adsorbate_counts", {})
