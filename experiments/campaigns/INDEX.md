@@ -18,13 +18,20 @@ per-run REPORT.md is uncommitted (lives next to the run dir, which is
 |  1 | cu111_co_camp       | Cu(111)     | CO/H/H₂O                | U=0,  pH=0          | done        |  −397.640   | CO:8 H:3 H₂O:0 (ceiling)   | 17 min |
 |  2 | cu100_co_camp       | Cu(100)     | CO/H/H₂O                | U=0,  pH=0          | done†       |  −450.106   | CO:8 H:1 H₂O:2 (ceiling)   | 67 min |
 |  3 | cu211_co_camp       | Cu(211)     | CO/H/H₂O                | U=0,  pH=0          | done‡       |  −435.784   | CO:9\* H:1 H₂O:2 (bug 9)   | 19 min |
-|  4 | pt111_orr_camp      | Pt(111)     | O/OH/OOH/H              | U=0.8, pH=0         | running     |     —       | —                          |  —     |
-|  5 | pt211_nrr_camp      | Pt(211)     | N/NH/NH₂/NH₃/H          | U=−0.5, pH=0        | queued      |     —       | —                          |  —     |
-|  6 | ag111_co_camp       | Ag(111)     | CO/H/H₂O                | U=0,  pH=0          | queued      |     —       | —                          |  —     |
-|  7 | pd111_hsat_camp     | Pd(111)     | H (max=16)              | U=0,  pH=0          | queued      |     —       | —                          |  —     |
-|  8 | ni111_chx_camp      | Ni(111)     | C/CH/CH₂/CH₃/H          | U=0,  pH=0          | queued      |     —       | —                          |  —     |
-|  9 | au111_co_camp       | Au(111)     | CO/OH                   | U=0,  pH=0          | queued      |     —       | —                          |  —     |
-| 10 | ru0001_oh_camp      | Ru(0001)    | H₂O/OH/O                | U=0,  pH=0          | queued      |     —       | —                          |  —     |
+|  4 | pt111_orr_camp      | Pt(111)     | O/OH/OOH/H              | U=0.8, pH=0         | done        |  −481.319   | OH:6 OOH:4 (ceiling§)      | 33 min |
+|  5 | pt211_nrr_camp      | Pt(211)     | N/NH/NH₂/NH₃/H          | U=−0.5, pH=0        | done†       |  −459.675   | N:4 NH₃:5§                 | 74 min |
+|  6 | ag111_co_camp       | Ag(111)     | CO/H/H₂O                | U=0,  pH=0          | done†       |  −218.485   | CO:4 H:1 (weak binding)    | 32 min |
+|  7 | pd111_hsat_camp     | Pd(111)     | H (max=16)              | U=0,  pH=0          | done ✨     |  −322.469   | **H:16 = 1 ML (clean)**    |  8 min |
+|  8 | ni111_chx_camp      | Ni(111)     | C/CH/CH₂/CH₃/H          | U=0,  pH=0          | done        |  −514.931   | CHₓ mix§ (GPR-dominated)   | 20 min |
+|  9 | au111_co_camp       | Au(111)     | CO/OH                   | U=0,  pH=0          | done†       |  −296.041   | CO:4 OH:3 (most inert)     | 80 min |
+| 10 | ru0001_oh_camp      | Ru(0001)    | H₂O/OH/O                | U=0,  pH=0          | done ✨     |  **−581.995** | O:6 H₂O:4 (lowest G in sweep) | 12 min |
+
+**§ breakdown subject to bug 12** (element-overlapping species → greedy
+`infer_adsorbate_counts` miscount). GCE values are still correct.
+**✨ clean runs** with no constraint violations, low reject rate, fast
+turnaround — the GA pipeline's happy path.
+**Total sweep wall time:** ~6 h 20 min across 10 campaigns on a single
+NVIDIA 6 GiB GPU.
 
 ## Bugs found / fixed during the run
 
