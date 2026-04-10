@@ -225,6 +225,15 @@ def run(
                     retrain_gpr(gpr, store)
 
             # Convergence check — stop spawning if stalled, drain active futures
+            # Compute the kappa for this poll cycle even on stop-pending
+            # iterations so the status line stays informative. The schedule
+            # decays gpr_kappa toward gpr_kappa_min as evaluations
+            # accumulate and bumps it up when stall_count grows, so a stuck
+            # run is pushed back into exploration without operator
+            # intervention.
+            from galoop.gpr import effective_kappa
+            kappa_now = effective_kappa(config, total_evals, stall_count)
+
             if _should_stop(total_evals, stall_count, spawn_stall_count, config):
                 if not active_futures:
                     log.info("Convergence criteria met.")
@@ -237,6 +246,7 @@ def run(
                     active_futures, relax_structure, stage_configs,
                     slab_info.n_slab_atoms,
                     pair_counts, struct_cache, gpr,
+                    gpr_kappa=kappa_now,
                 )
                 if not spawned and len(active_futures) < config.scheduler.nworkers:
                     spawn_stall_count += 1
@@ -244,11 +254,12 @@ def run(
                 # it's reset only when a new converged evaluation arrives
                 # (see the total_evals > prev_evals block above).
 
+            kappa_str = f"  kappa={kappa_now:.2f}" if config.ga.gpr_guided else ""
             log.info(
-                "Evals=%d  Best=%.4f eV  Stall=%d/%d  SpawnStall=%d/%d  Active=%d",
+                "Evals=%d  Best=%.4f eV  Stall=%d/%d  SpawnStall=%d/%d  Active=%d%s",
                 total_evals, best_gce, stall_count, config.ga.max_stall,
                 spawn_stall_count, config.ga.max_spawn_stall,
-                len(active_futures),
+                len(active_futures), kappa_str,
             )
             time.sleep(POLL_INTERVAL)
 

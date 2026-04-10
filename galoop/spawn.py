@@ -48,35 +48,47 @@ log = logging.getLogger(__name__)
 def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None:
     """Spawn the initial GA population, stratified across coverage levels.
 
-    Honors the ``galoopstop`` sentinel file between structures for fast
-    abandonment: if the user touches galoopstop mid-init-pop, we stop at the
-    next iteration boundary and return whatever was built so far. Structures
-    whose ``snap_to_surface`` BFGS call exceeds ``config.slab.snap_timeout_s``
-    are skipped and not inserted into the store (so the population may end up
-    smaller than ``population_size``, which is fine — the main loop proceeds
-    with whatever it gets).
+    For each target composition we build a random placement and submit
+    ``snap_structure`` as a Parsl task; the snap BFGS runs on a worker
+    (not the main galoop process) so the MLIP model never has to be
+    loaded into the main process's memory. Snap results are collected,
+    written out, and inserted into the store after every task returns.
+
+    Honors the ``galoopstop`` sentinel file between submissions so the
+    user can abort init-pop mid-flight. Per-structure snap failures
+    (timeout, CUDA OOM, bad placement) are logged and the offending
+    structure is dropped from the population, so the final built count
+    may be less than ``population_size``.
     """
+    import shutil
+    from concurrent.futures import TimeoutError as FutureTimeout
+
+    from galoop.engine.scheduler import snap_structure
     from galoop.loop import _stop_requested
 
     run_dir = store.run_dir
-
-    # Resolve the snap backend once, up front — users pay the model-load cost
-    # a single time regardless of population_size. Defaults to the first
-    # calculator stage's backend/params if config.snap_stage is unset.
     snap_stage_cfg = _resolve_snap_stage(config)
+    snap_timeout_s = float(getattr(config.slab, "snap_timeout_s", 120.0))
 
     ads_atoms = load_ads_template_dict(config.adsorbates)
+
+    # Scratch directory for the POSCARs + CONTCARs the snap workers read/write.
+    # Cleaned up at the end of this function.
+    snap_scratch = run_dir / "_snap_tmp"
+    snap_scratch.mkdir(parents=True, exist_ok=True)
 
     # Stratified seeding: cycle target totals across [min_adsorbates, max_adsorbates]
     # so the initial population spans every coverage level instead of biasing
     # random draws toward the middle of the range.
     lo, hi = config.ga.min_adsorbates, config.ga.max_adsorbates
     coverage_levels = list(range(lo, hi + 1))
-    built = 0
+
+    # --- Stage 1: build random structures and submit snap tasks ---
+    tasks: list[tuple[int, dict, object, Path]] = []
     for i in range(config.ga.population_size):
         if _stop_requested(run_dir):
             log.info(
-                "Stop requested during init-pop at structure %d/%d — abandoning",
+                "Stop requested during init-pop at %d/%d — abandoning",
                 i, config.ga.population_size,
             )
             break
@@ -91,39 +103,66 @@ def build_initial_population(config, slab_info, store: GaloopStore, rng) -> None
                 slab_info, config.adsorbates, ads_atoms, counts, rng,
             )
         except Exception as exc:
-            log.warning("structure_%05d: placement failed (%s) — falling back", i, exc)
+            log.warning("init %05d: placement failed (%s) — falling back", i, exc)
             first = next(iter(ads_atoms))
             counts = {first: 1}
             current = build_random_structure(
                 slab_info, config.adsorbates, ads_atoms, counts, rng,
             )
 
-        # Quick constrained pre-relax: let adsorbates settle toward surface.
-        # Wrapped in a per-structure wall-clock timeout so a single hung MACE
-        # BFGS call can't freeze the whole init-pop phase (see FINDINGS.md
-        # cycle 4a).
+        # Stamp the original slab constraints so selective-dynamics survives
+        # the POSCAR round-trip to the worker.
+        current.set_constraint(slab_info.atoms.constraints)
+
+        task_dir = snap_scratch / f"{i:05d}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+        poscar = task_dir / "POSCAR"
+        write(str(poscar), current, format="vasp")
+
+        fut = snap_structure(
+            poscar_path=str(poscar),
+            snap_stage_cfg=snap_stage_cfg,
+            n_slab_atoms=slab_info.n_slab_atoms,
+            z_min_offset=float(config.slab.snap_z_min_offset),
+            z_max_offset=float(config.slab.snap_z_max_offset),
+        )
+        tasks.append((i, dict(counts), fut, task_dir))
+
+    # --- Stage 2: collect snap futures, write into the store ---
+    built = 0
+    for i, counts, fut, task_dir in tasks:
         try:
-            current = snap_to_surface(
-                current, config, slab_info.n_slab_atoms,
-                snap_stage=snap_stage_cfg,
-            )
-        except SnapTimeoutError as exc:
-            log.warning(
-                "structure_%05d: snap_to_surface timed out after %.1fs — skipping",
-                i, exc.timeout_s,
-            )
+            contcar_path = fut.result(timeout=snap_timeout_s)
+        except FutureTimeout:
+            log.warning("init %05d: snap timed out after %.1fs — skipping",
+                        i, snap_timeout_s)
+            continue
+        except Exception as exc:
+            log.warning("init %05d: snap failed (%s) — skipping", i, exc)
             continue
 
-        ind = Individual.from_init(extra_data={"adsorbate_counts": dict(counts)})
+        try:
+            snapped = read_atoms(Path(contcar_path), format="vasp")
+        except Exception as exc:
+            log.warning("init %05d: could not read snap result (%s) — skipping",
+                        i, exc)
+            continue
+
+        ind = Individual.from_init(extra_data={"adsorbate_counts": counts})
         struct_dir = store.insert(ind)
         poscar = struct_dir / "POSCAR"
-        write(str(poscar), current, format="vasp")
+        snapped.set_constraint(slab_info.atoms.constraints)
+        write(str(poscar), snapped, format="vasp")
         ind.geometry_path = str(poscar)
         store.update(ind)
         built += 1
-        log.debug("initial structure %05d: %s", i, dict(counts))
+        log.debug("initial structure %05d: %s", i, counts)
 
-    log.info("Initial population: %d structures", built)
+    # Best-effort cleanup of the scratch tree.
+    shutil.rmtree(snap_scratch, ignore_errors=True)
+
+    log.info("Initial population: %d structures (%d submitted, %d dropped)",
+             built, len(tasks), len(tasks) - built)
 
 
 class SnapTimeoutError(RuntimeError):
@@ -287,6 +326,7 @@ def fill_workers(
     pair_counts: dict | None = None,
     struct_cache: dict | None = None,
     gpr=None,
+    gpr_kappa: float | None = None,
 ) -> bool:
     """Spawn offspring until the worker pool is full, submit via Parsl.
 
@@ -320,7 +360,9 @@ def fill_workers(
         )
 
         if use_gpr:
-            result = spawn_via_gpr(gpr, store, config, slab_info, rng)
+            result = spawn_via_gpr(
+                gpr, store, config, slab_info, rng, kappa=gpr_kappa,
+            )
         else:
             result = spawn_one(store, config, slab_info, rng, pair_counts)
 
@@ -585,12 +627,20 @@ def spawn_random(store: GaloopStore, config, slab_info, rng):
     return ind, current
 
 
-def spawn_via_gpr(gpr, store: GaloopStore, config, slab_info, rng):
+def spawn_via_gpr(gpr, store: GaloopStore, config, slab_info, rng,
+                  kappa: float | None = None):
     """Generate a structure with a GPR-suggested composition.
+
+    *kappa* overrides ``config.ga.gpr_kappa`` so the loop can apply an
+    annealing/stall-aware schedule (see
+    :func:`galoop.gpr.effective_kappa`). Falls back to the static config
+    value when not provided, preserving the legacy behavior.
 
     Returns (Individual, Atoms) or None.
     """
-    counts = gpr.suggest(rng, kappa=config.ga.gpr_kappa)
+    if kappa is None:
+        kappa = config.ga.gpr_kappa
+    counts = gpr.suggest(rng, kappa=kappa)
 
     if sum(counts.values()) == 0:
         return None

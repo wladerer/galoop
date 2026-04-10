@@ -50,6 +50,89 @@ def relax_structure(
     return pipeline.run(atoms, struct_path, n_slab_atoms=n_slab_atoms)
 
 
+@python_app
+def snap_structure(
+    poscar_path: str,
+    snap_stage_cfg: dict,
+    n_slab_atoms: int,
+    z_min_offset: float,
+    z_max_offset: float,
+    fmax: float = 0.2,
+    max_steps: int = 30,
+) -> str:
+    """Constrained pre-relax ("snap-to-surface") on a Parsl worker.
+
+    Reads the POSCAR at ``poscar_path``, runs a short BFGS with the slab
+    atoms fixed, clamps adsorbate z-coordinates into
+    ``[slab_top + z_min_offset, slab_top + z_max_offset]``, restores the
+    slab's original selective-dynamics constraints, writes ``CONTCAR``
+    next to the POSCAR, and returns the CONTCAR path.
+
+    Running this on a Parsl worker instead of the main process keeps the
+    MLIP model out of the main galoop process's memory space, which
+    matters on tight-GPU deployments where the main proc and the worker
+    otherwise contend for VRAM (see bug 5 in the 2026-04-09 validation
+    sweep).
+
+    On failure of the BFGS step the z-clamp is still applied and the
+    (unrelaxed-but-clamped) CONTCAR is returned — failures propagate only
+    if the POSCAR cannot be read or if writing the CONTCAR fails. Callers
+    should wrap ``.result()`` in a timeout so a hung forward pass cannot
+    freeze init-pop.
+    """
+    import contextlib
+    import logging
+    from pathlib import Path
+
+    import numpy as np
+    from ase.constraints import FixAtoms
+    from ase.io import read, write
+    from ase.optimize import BFGS
+
+    from galoop.engine import backends
+
+    worker_log = logging.getLogger("galoop.snap_worker")
+
+    poscar = Path(poscar_path)
+    atoms = read(str(poscar), format="vasp")
+
+    # Preserve the slab's original selective-dynamics constraints so we
+    # can restore them after the snap BFGS (which needs the whole slab
+    # pinned, not just the bottom layer).
+    orig_constraints = list(atoms.constraints) if atoms.constraints else []
+
+    factory, _drives = backends.resolve(snap_stage_cfg["type"])
+    calc = factory(dict(snap_stage_cfg.get("params", {})))
+    with contextlib.suppress(AttributeError):
+        calc.results.clear()
+
+    atoms.calc = calc
+    atoms.set_constraint(FixAtoms(indices=list(range(n_slab_atoms))))
+
+    try:
+        dyn = BFGS(atoms, logfile=None)
+        dyn.run(fmax=fmax, steps=max_steps)
+    except Exception as exc:
+        worker_log.warning("snap BFGS failed (%s) — falling back to z-clamp only", exc)
+
+    # Clamp adsorbate z-coordinates to a safe window above the slab.
+    pos = atoms.get_positions()
+    slab_top_z = float(pos[:n_slab_atoms, 2].max())
+    z_min = slab_top_z + z_min_offset
+    z_max = slab_top_z + z_max_offset
+    for idx in range(n_slab_atoms, len(atoms)):
+        pos[idx, 2] = float(np.clip(pos[idx, 2], z_min, z_max))
+    atoms.set_positions(pos)
+
+    # Detach the calculator and restore the original slab constraints.
+    atoms.calc = None
+    atoms.set_constraint(orig_constraints)
+
+    contcar = poscar.with_name("CONTCAR_snap")
+    write(str(contcar), atoms, format="vasp")
+    return str(contcar)
+
+
 # ---------------------------------------------------------------------------
 # Config builder
 # ---------------------------------------------------------------------------

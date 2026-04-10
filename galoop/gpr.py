@@ -17,6 +17,41 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# UCB exploration schedule
+# ---------------------------------------------------------------------------
+
+def effective_kappa(config, total_evals: int, stall_count: int) -> float:
+    """Return the UCB exploration parameter for the current loop state.
+
+    Two effects are combined:
+
+    - **Exponential decay** of ``ga.gpr_kappa`` toward ``ga.gpr_kappa_min``
+      with half-life ``ga.gpr_kappa_half_life`` (in converged evaluations).
+      Set ``half_life`` to 0 to disable decay entirely (legacy behavior).
+    - **Stall-driven boost** that adds ``ga.gpr_kappa_stall_boost``
+      multiplied by ``stall_count / max_stall`` so a run that stops
+      improving forces re-exploration without operator intervention.
+
+    The returned value is the kappa to pass to :func:`CompositionGPR.suggest`
+    on this poll cycle.
+    """
+    k0 = float(config.ga.gpr_kappa)
+    k_min = float(config.ga.gpr_kappa_min)
+    half_life = int(getattr(config.ga, "gpr_kappa_half_life", 0))
+    boost = float(getattr(config.ga, "gpr_kappa_stall_boost", 0.0))
+    max_stall = max(1, int(config.ga.max_stall))
+
+    if half_life > 0:
+        decayed = k0 * (0.5 ** (total_evals / half_life))
+        base = max(k_min, decayed)
+    else:
+        base = k0
+
+    stall_frac = min(1.0, max(0, stall_count) / max_stall)
+    return base + boost * stall_frac
+
+
 class CompositionGPR:
     """GPR surrogate over adsorbate composition space.
 
@@ -156,8 +191,8 @@ class CompositionGPR:
         chosen = candidates[best_idx]
         mean_chosen, std_chosen = means[best_idx], stds[best_idx]
         log.debug(
-            "GPR suggest: %s  predicted=%.3f±%.3f eV  UCB=%.3f",
-            chosen, mean_chosen, std_chosen, ucb[best_idx],
+            "GPR suggest (kappa=%.3f): %s  predicted=%.3f±%.3f eV  UCB=%.3f",
+            kappa, chosen, mean_chosen, std_chosen, ucb[best_idx],
         )
         return chosen
 
