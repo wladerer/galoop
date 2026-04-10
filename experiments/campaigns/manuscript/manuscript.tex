@@ -18,6 +18,11 @@
 \usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit,
                 backgrounds, calc, shadows}
 
+% Force tcolorbox environments from scientific_report.sty to respect
+% the text width. Without this the boxes extend ~200pt past the right
+% margin on some pages — a known tcolorbox + parskip interaction.
+\tcbset{width=\linewidth}
+
 % Pull in figures both from our own figures/ dir and from the
 % validation-sweep report next door, so we don't duplicate PNGs.
 \graphicspath{{figures/}{../report/figures/}}
@@ -530,8 +535,8 @@ call is passed through a six-stage classifier in
     $z_{\max}+3$\,\AA{} above the slab top?
   \item \textbf{Surface binding}: every adsorbate \emph{molecule}
     (grouped via covalent radii in
-    \texttt{galoop.science.reproduce.\_group\_molecules}) has at least
-    one atom within 1.3$\times$covalent-radii of a slab atom.
+    \texttt{\_group\_molecules}) has at least one atom within
+    $1.3\times$covalent-radii of a slab atom.
   \item \textbf{Atom overlap}: no two atoms closer than 0.5\,\AA{}.
   \item \textbf{Fingerprint cascade}: composition gate $\to$ energy
     gate $\to$ distance-histogram cosine pre-filter $\to$
@@ -794,25 +799,33 @@ non-GPR box, the surrogate is steering toward strictly better basins.
 
 \paragraph{Where GPR helps, where it misleads.}
 
-\begin{methodology}[Three observed GPR regimes]
-\textbf{Helpful regime.} Pt(111)-ORR and Ni(111)-CH$_x$: 4--5 species,
-enough composition dimensions for the Mat{\'e}rn kernel to learn a
-meaningful surface, and GPR proposals steer directly into
+\noindent\begin{tcolorbox}[colback=lightgreen, colframe=sciencegreen,
+  fonttitle=\bfseries\color{white}, title=Three observed GPR regimes,
+  coltitle=white, colbacktitle=sciencegreen,
+  boxrule=1pt, arc=3pt, left=8pt, right=8pt, top=6pt, bottom=6pt,
+  before skip=12pt, after skip=12pt,
+  grow to left by=0pt, grow to right by=0pt]
+\sloppy\small
+\textbf{Helpful regime.} Pt(111)-ORR and Ni(111)-CH$_x$ have 4--5
+species — enough composition dimensions for the Mat{\'e}rn kernel to
+learn a meaningful surface. GPR proposals steer directly into
 saturation-level OH/OOH and CH$_2$/CH$_3$ mixtures that the GA
-operators would only reach by many splice/merge cycles.\\[4pt]
-\textbf{Irrelevant regime.} Cu(111) with CO/H/H$_2$O: the search space
-is small enough that \texttt{init} placement alone already hit the
-optimum before GPR collected its \texttt{gpr\_min\_samples}=20
-training points. GPR activated but never contributed to the top 5.\\[4pt]
-\textbf{Misled regime.} Pt(211)-NRR: the GPR is trained on species
-counts that are reported by the (buggy) greedy
-\texttt{infer\_adsorbate\_counts}, which over-credits NH$_3$ at the
-expense of the NH$_x$ intermediates. GPR proposals inherit the bias
-and cluster at ``apparently high NH$_3$'' compositions. The $G$ values
-are still physically correct (CHE linearity absorbs the miscount),
-but the GPR's composition map is wrong. See
-Section~\ref{sec:limitations}.
-\end{methodology}
+operators would only reach by many splice/merge cycles.
+
+\medskip\noindent
+\textbf{Irrelevant regime.} Cu(111) with CO/H/H$_2$O has a search
+space small enough that \texttt{init} placement alone hit the optimum
+before GPR collected its training-data threshold. GPR activated but
+never contributed to the top 5.
+
+\medskip\noindent
+\textbf{Misled regime.} On Pt(211)-NRR the GPR is trained on species
+counts reported by the buggy greedy \texttt{infer\_adsorbate\_counts},
+which over-credits NH$_3$ at the expense of the NH$_x$ intermediates.
+GPR proposals inherit the bias. The $G$ values are still physically
+correct (CHE linearity absorbs the miscount), but the GPR's
+composition map is wrong. See Section~\ref{sec:limitations}.
+\end{tcolorbox}
 
 \paragraph{Effective kappa in practice.}
 Table~\ref{tab:kappa} tabulates $\kappa(N_{\text{eval}}, s)$ from
@@ -943,41 +956,43 @@ Five things, ranked by how much of the design they exercised:
 \subsection{Bugs surfaced and closed}
 
 \begin{table}[H]
-\centering\small
-\begin{tabular}{@{}clp{0.48\linewidth}l@{}}
+\centering\footnotesize
+\sloppy
+\begin{tabular}{@{}l p{0.28\linewidth} p{0.48\linewidth} l@{}}
 \toprule
 \# & area & description & status \\
 \midrule
-1  & \texttt{science/surface.py::\_surface\_normal} &
+1  & \texttt{surface.py} \newline \texttt{\_surface\_normal} &
    Used $\hat c$ instead of $\widehat{\mathbf{a}\times\mathbf{b}}$;
    wrong on tilted-$c$ cells. &
-   fixed \texttt{d5e5687}, regression test in \texttt{325c6ce} \\
+   fix \texttt{d5e5687} \\
 4  & \texttt{loop.py} exit path &
-   \texttt{parsl.clear()} called without \texttt{parsl.dfk().cleanup()};
-   Python hung at the end of every clean run. &
-   fixed \texttt{0a22b65} \\
-9  & \texttt{spawn.py::spawn\_one} crossover bounds check &
+   \texttt{parsl.clear()} called without
+   \texttt{parsl.dfk().cleanup()}; Python hung at the end of every
+   clean run. &
+   fix \texttt{0a22b65} \\
+9  & \texttt{spawn.py} crossover bounds check &
    Enforced total \texttt{max\_adsorbates} but not per-species
    \texttt{max\_count}. Caught on Cu(211). &
-   fixed \texttt{a6a0fb9} \\
+   fix \texttt{a6a0fb9} \\
 10 & torch / torchvision / e3nn &
-   \texttt{fairchem-core} install bumped torch 2.6$\to$2.8;
-   torchvision 0.21 and e3nn pickling formats broke. &
-   torchvision bumped; e3nn pinned \\
-12 & \texttt{spawn.py::infer\_adsorbate\_counts} &
+   \texttt{fairchem-core} install bumped torch 2.6$\to$2.8; torchvision
+   0.21 and e3nn pickling formats broke. &
+   torchvision bumped \\
+12 & \texttt{spawn.py} \newline \texttt{infer\_ads\_counts} &
    Greedy formula-length miscount for element-overlapping species
-   (O/OH/OOH/H, NH$_x$, CH$_x$). $G$ invariant under CHE linearity,
+   (O/OH/OOH/H, NH$_x$, CH$_x$). $G$ invariant under CHE linearity;
    reports unreliable. &
-   \textbf{open} (Section~\ref{sec:limitations}) \\
---- & \texttt{engine/scheduler.py} parsl logs &
-    Unbounded \texttt{manager.log} growth when workers outlive their
-    parent. 30+~GB leaked across 18 orphaned workers during the
-    sweep before it filled the disk. &
-    fixed via \texttt{RotatingFileHandler} monkey-patch \\
+   \textbf{open} \\
+5 & \texttt{scheduler.py} parsl logs &
+   Unbounded \texttt{manager.log} growth when workers outlive their
+   parent. 30+~GB leaked across 18 orphans before the disk filled. &
+   fix via rotating FH \\
 \bottomrule
 \end{tabular}
 \caption{Code bugs surfaced and closed during the validation sweep.
-Commit SHAs reference the \texttt{main} branch.}
+Commit SHAs reference the \texttt{main} branch. Bug 12 is the one
+still open; see the limitations box below.}
 \label{tab:bugs}
 \end{table}
 
