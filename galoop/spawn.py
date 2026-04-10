@@ -571,9 +571,8 @@ def spawn_one(store: GaloopStore, config, slab_info, rng,
         # can yield a child with CO > max_count as long as the total stays
         # below max_adsorbates. Reject such children.
         if op in _TWO_PARENT_OPS:
-            trial_counts = infer_adsorbate_counts(
-                child.get_chemical_symbols()[slab_info.n_slab_atoms:],
-                config.adsorbates,
+            trial_counts = infer_adsorbate_counts_structural(
+                child, slab_info.n_slab_atoms, config.adsorbates,
             )
             total = sum(trial_counts.values())
             if total > config.ga.max_adsorbates or total < config.ga.min_adsorbates:
@@ -587,9 +586,8 @@ def spawn_one(store: GaloopStore, config, slab_info, rng,
         if op in _PRESERVE_PARENT_COUNTS_OPS:
             ads_counts = parents[0].extra_data.get("adsorbate_counts", {})
         else:
-            ads_counts = infer_adsorbate_counts(
-                child.get_chemical_symbols()[slab_info.n_slab_atoms:],
-                config.adsorbates,
+            ads_counts = infer_adsorbate_counts_structural(
+                child, slab_info.n_slab_atoms, config.adsorbates,
             )
         ind = Individual.from_parents(
             parents=parents,
@@ -726,10 +724,16 @@ def sample_operator(rng, config) -> str:
 
 
 def infer_adsorbate_counts(element_symbols, adsorbate_configs) -> dict[str, int]:
-    """Reconstruct {symbol: count} from a slab+adsorbate atoms list.
+    """Reconstruct {symbol: count} from a flat element-symbol list.
 
-    Used after crossover/merge operators to figure out which adsorbate
-    species are present in the child.
+    **Deprecated in favour of** :func:`infer_adsorbate_counts_structural`,
+    which uses covalent-radii connectivity to identify individual
+    molecules. This greedy version is kept as a fallback: it walks
+    species by descending formula length and assigns as many of the
+    longest as the element budget allows, which systematically
+    over-credits the longest formula when species share elements
+    (bug 12). Use the structural version whenever the full
+    :class:`Atoms` object and ``n_slab`` are available.
     """
     from galoop.science.surface import parse_formula
 
@@ -745,5 +749,93 @@ def infer_adsorbate_counts(element_symbols, adsorbate_configs) -> dict[str, int]
             counts[ads.symbol] = n
             for e, c in formula_elems.items():
                 remaining[e] -= n * c
+
+    return counts
+
+
+def infer_adsorbate_counts_structural(
+    atoms,
+    n_slab: int,
+    adsorbate_configs,
+) -> dict[str, int]:
+    """Count adsorbate species by grouping atoms into molecules.
+
+    Uses :func:`galoop.science.reproduce._group_molecules`
+    (covalent-radii connectivity) to identify individual adsorbate
+    molecules in a relaxed structure, then matches each molecule's
+    chemical formula against the configured adsorbate species.
+
+    This is the structure-aware replacement for
+    :func:`infer_adsorbate_counts`, which uses greedy element-budget
+    arithmetic and systematically over-credits the longest formula when
+    species share elements (bug 12). The greedy version is used as a
+    fallback when structural grouping fails or when the caller does not
+    have the full :class:`Atoms` object.
+
+    Parameters
+    ----------
+    atoms : ASE Atoms with slab + adsorbates
+    n_slab : number of leading slab atoms
+    adsorbate_configs : iterable of AdsorbateConfig
+
+    Returns
+    -------
+    dict[str, int] — per-species adsorbate counts
+    """
+    from galoop.science.reproduce import _group_molecules
+    from galoop.science.surface import parse_formula
+
+    # Build a lookup: frozenset of (element, count) pairs -> species symbol.
+    formula_to_symbol: dict[frozenset, str] = {}
+    for cfg in adsorbate_configs:
+        formula = Counter(parse_formula(cfg.symbol))
+        key = frozenset(formula.items())
+        if key in formula_to_symbol:
+            log.warning(
+                "Adsorbate species '%s' and '%s' have the same formula %s — "
+                "structural counting cannot distinguish isomers. '%s' will be "
+                "used for matching.",
+                formula_to_symbol[key], cfg.symbol, dict(formula),
+                formula_to_symbol[key],
+            )
+        else:
+            formula_to_symbol[key] = cfg.symbol
+
+    try:
+        molecules = _group_molecules(atoms, n_slab)
+    except Exception as exc:
+        log.warning(
+            "Structural molecule grouping failed (%s) — falling back to "
+            "greedy element counting", exc,
+        )
+        return infer_adsorbate_counts(
+            atoms.get_chemical_symbols()[n_slab:], adsorbate_configs,
+        )
+
+    if not molecules:
+        return {}
+
+    symbols_list = atoms.get_chemical_symbols()
+    counts: dict[str, int] = {}
+    unmatched_formulas: list[dict] = []
+
+    for mol_indices in molecules:
+        mol_formula = Counter(symbols_list[i] for i in mol_indices)
+        key = frozenset(mol_formula.items())
+
+        if key in formula_to_symbol:
+            sym = formula_to_symbol[key]
+            counts[sym] = counts.get(sym, 0) + 1
+        else:
+            unmatched_formulas.append(dict(mol_formula))
+
+    if unmatched_formulas:
+        log.debug(
+            "infer_adsorbate_counts_structural: %d molecule(s) did not "
+            "match any configured species: %s. Possible causes: bond "
+            "breaking/recombination during relaxation, or slab atom "
+            "extraction.",
+            len(unmatched_formulas), unmatched_formulas,
+        )
 
     return counts
