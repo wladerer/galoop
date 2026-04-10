@@ -10,12 +10,33 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from parsl.app.app import python_app
-from parsl.config import Config
-from parsl.executors import HighThroughputExecutor
-from parsl.providers import LocalProvider, SlurmProvider, TorqueProvider
+# Install rotating log file handlers on parsl's logger BEFORE any parsl
+# module that uses set_file_logger gets a chance to grab it. See
+# galoop/engine/_parsl_log_rotation.py for the rationale (bug 5 / the
+# orphaned-worker leak that filled /tmp during the validation sweep).
+from galoop.engine._parsl_log_rotation import install_rotating_handler
+
+install_rotating_handler()
+
+from parsl.app.app import python_app  # noqa: E402
+from parsl.config import Config  # noqa: E402
+from parsl.executors import HighThroughputExecutor  # noqa: E402
+from parsl.executors.high_throughput.executor import (  # noqa: E402
+    DEFAULT_LAUNCH_CMD,
+)
+from parsl.providers import LocalProvider, SlurmProvider, TorqueProvider  # noqa: E402
 
 log = logging.getLogger(__name__)
+
+
+# Worker launch command that routes through the rotating-log wrapper
+# instead of parsl's default ``process_worker_pool.py``. The wrapper
+# installs the same log rotation patch in each worker subprocess
+# before calling parsl's worker entry point via runpy.
+GALOOP_WORKER_LAUNCH_CMD = DEFAULT_LAUNCH_CMD.replace(
+    "process_worker_pool.py",
+    "python -m galoop.engine._parsl_worker_wrapper",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +211,7 @@ def build_parsl_config(config, run_dir=None) -> Config:
 
         executor = HighThroughputExecutor(
             label="slurm",
+            launch_cmd=GALOOP_WORKER_LAUNCH_CMD,
             worker_logdir_root=worker_log_dir,
             provider=SlurmProvider(
                 partition=resources.get("partition", "default"),
@@ -207,6 +229,7 @@ def build_parsl_config(config, run_dir=None) -> Config:
     elif sched_type == "pbs":
         executor = HighThroughputExecutor(
             label="pbs",
+            launch_cmd=GALOOP_WORKER_LAUNCH_CMD,
             worker_logdir_root=worker_log_dir,
             provider=TorqueProvider(
                 queue=resources.get("queue", "default"),
@@ -225,6 +248,7 @@ def build_parsl_config(config, run_dir=None) -> Config:
         # instance instead of being shared across threads.
         executor = HighThroughputExecutor(
             label="local",
+            launch_cmd=GALOOP_WORKER_LAUNCH_CMD,
             worker_logdir_root=worker_log_dir,
             max_workers_per_node=nworkers,
             provider=LocalProvider(
