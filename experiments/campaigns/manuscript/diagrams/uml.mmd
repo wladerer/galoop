@@ -1,0 +1,98 @@
+%% Canonical source for the galoop UML class diagram.
+%%
+%% Shows the six types that the rest of the codebase revolves around:
+%%   - GaloopConfig  (pydantic root, holds every sub-config)
+%%   - GaloopStore   (SQLite-backed persistence of Individuals)
+%%   - Individual    (single structure with status + operator lineage)
+%%   - Pipeline      (ordered list of CalculatorStages)
+%%   - CalculatorStage (one relaxation step, dispatches via backends)
+%%   - CompositionGPR  (surrogate model over composition -> GCE)
+%%
+%% Relationships:
+%%   GaloopConfig  *-- "1"  SlabConfig
+%%   GaloopConfig  *-- "1..*" AdsorbateConfig
+%%   GaloopConfig  *-- "1..*" StageConfig
+%%   GaloopConfig  *-- "1"  GAConfig
+%%   GaloopStore   "1" o-- "0..*" Individual
+%%   Pipeline      "1" *-- "1..*" CalculatorStage
+%%   CalculatorStage ..> backends : uses
+%%   CompositionGPR ..> GaloopStore : reads converged
+
+classDiagram
+    class GaloopConfig {
+        +slab : SlabConfig
+        +adsorbates : list~AdsorbateConfig~
+        +calculator_stages : list~StageConfig~
+        +ga : GAConfig
+        +conditions : ConditionsConfig
+        +fingerprint : FingerprintConfig
+        +scheduler : SchedulerConfig
+    }
+
+    class GaloopStore {
+        -conn : sqlite3.Connection
+        -run_dir : Path
+        +insert(ind) Path
+        +update(ind)
+        +get_by_status(status) list~Individual~
+        +best() Individual
+        +selectable_pool() list~Individual~
+        +count_by_status() dict
+        +to_dataframe() DataFrame
+    }
+
+    class Individual {
+        +id : str
+        +parent_ids : list~str~
+        +operator : OPERATOR
+        +status : STATUS
+        +raw_energy : float
+        +grand_canonical_energy : float
+        +extra_data : dict
+        +from_init(extra_data) Individual
+        +from_parents(parents, operator) Individual
+        +with_energy(raw, gce) Individual
+        +mark_duplicate() Individual
+    }
+
+    class Pipeline {
+        +stages : list~CalculatorStage~
+        +run(atoms, struct_dir, n_slab) dict
+    }
+
+    class CalculatorStage {
+        +name : str
+        +type : str
+        +fmax : float
+        +max_steps : int
+        +fix_slab_first : bool
+        +params : dict
+        -_factory : Callable
+        -_drives_own_relaxation : bool
+        +make_calculator() ASECalculator
+        +run(atoms, struct_dir) StageResult
+    }
+
+    class CompositionGPR {
+        -_gp : GaussianProcessRegressor
+        -_X_train : ndarray
+        -_y_train : ndarray
+        +is_ready : bool
+        +fit(compositions, energies)
+        +predict(counts) tuple
+        +suggest(rng, kappa) dict
+    }
+
+    GaloopConfig "1" *-- "1" SlabConfig
+    GaloopConfig "1" *-- "1..*" AdsorbateConfig
+    GaloopConfig "1" *-- "1..*" StageConfig
+    GaloopConfig "1" *-- "1" GAConfig
+
+    GaloopStore "1" o-- "0..*" Individual : persists
+
+    Pipeline "1" *-- "1..*" CalculatorStage
+
+    CalculatorStage ..> backends : resolve()
+    CompositionGPR ..> GaloopStore : reads converged
+    Individual --> OPERATOR
+    Individual --> STATUS

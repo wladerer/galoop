@@ -1,0 +1,70 @@
+%% Canonical source for the "galoop main loop" flowchart.
+%%
+%% This Mermaid source is the text-of-truth version; the manuscript
+%% renders the same diagram in TikZ for the PDF. If you need to edit,
+%% edit here first and then update the TikZ block in manuscript.tex.
+%%
+%% accTitle and accDescr are required by the markdown-mermaid-writing
+%% skill's style guide.
+
+flowchart TD
+    accTitle: Galoop GCGA Main Loop
+    accDescr: End-to-end flow of a galoop campaign. The main process seeds the initial population, spawns children via GA operators or GPR, dispatches snap and relax through Parsl workers, then harvests results through a six-stage classification pipeline before looping.
+
+    start([galoop run])
+    cal{refs set?}
+    calrun[calibrate via CHE]
+    loadcfg[load slab + config]
+    initpop[build_initial_population]
+    snap[snap_structure parsl task]
+    store[(GaloopStore / SQLite)]
+    poll{pool full?}
+    spawn[spawn_one / spawn_via_gpr]
+    relax[relax_structure parsl task]
+    harvest[harvest pipeline]
+    cconv{converged?}
+    cdes{desorbed?}
+    cunb{unbound?}
+    cclash{atom overlap?}
+    cdup{duplicate?}
+    cgce[compute GCE]
+    retrain[retrain GPR]
+    stopq{stall or max?}
+    done([Run complete])
+
+    start --> cal
+    cal -- no --> calrun --> loadcfg
+    cal -- yes --> loadcfg
+    loadcfg --> initpop
+    initpop --> snap
+    snap --> store
+    store --> poll
+    poll -- yes --> relax
+    poll -- no --> spawn
+    spawn --> relax
+    relax --> harvest
+    harvest --> cconv
+    cconv -- no --> store
+    cconv -- yes --> cdes
+    cdes -- yes --> store
+    cdes -- no --> cunb
+    cunb -- yes --> store
+    cunb -- no --> cclash
+    cclash -- yes --> store
+    cclash -- no --> cdup
+    cdup -- yes --> store
+    cdup -- no --> cgce
+    cgce --> retrain
+    retrain --> stopq
+    stopq -- no --> poll
+    stopq -- yes --> done
+
+    classDef startend fill:#dbeafe,stroke:#2563eb,color:#1e3a5f
+    classDef action fill:#dcfce7,stroke:#16a34a,color:#14532d
+    classDef decision fill:#fef9c3,stroke:#ca8a04,color:#713f12
+    classDef storage fill:#ede9fe,stroke:#7c3aed,color:#3b0764
+
+    class start,done startend
+    class calrun,loadcfg,initpop,snap,spawn,relax,harvest,cgce,retrain action
+    class cal,poll,cconv,cdes,cunb,cclash,cdup,stopq decision
+    class store storage

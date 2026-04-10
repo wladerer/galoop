@@ -46,3 +46,4 @@ slurm-*.out
 *.lot
 # Built PDFs from LaTeX sources in this repo (source is tracked, PDF is built)
 experiments/campaigns/report/report.pdf
+experiments/campaigns/manuscript/manuscript.pdf
