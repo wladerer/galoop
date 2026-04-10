@@ -1,10 +1,12 @@
 """Shared pytest fixtures."""
 
 import shutil
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
 import pytest
+from ase.io import write as ase_write
 
 
 @pytest.fixture
@@ -96,3 +98,24 @@ def converged_population(tmp_path, minimal_config, slab_info, temp_db):
         converged.append(updated)
 
     return converged
+
+
+@pytest.fixture(autouse=True)
+def _mock_snap_structure(monkeypatch):
+    """Replace the Parsl ``snap_structure`` app with a synchronous stub.
+
+    The real ``snap_structure`` is a ``@python_app`` that requires a loaded
+    Parsl DFK.  For unit tests we just copy the POSCAR to a CONTCAR_snap
+    and return an already-resolved ``Future``.
+    """
+    from galoop.engine import scheduler as sched_mod
+
+    def _fake_snap(**kwargs):
+        poscar_path = kwargs["poscar_path"]
+        contcar = Path(poscar_path).with_name("CONTCAR_snap")
+        shutil.copy(poscar_path, str(contcar))
+        fut = Future()
+        fut.set_result(str(contcar))
+        return fut
+
+    monkeypatch.setattr(sched_mod, "snap_structure", _fake_snap)

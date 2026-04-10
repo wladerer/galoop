@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -839,10 +840,11 @@ def infer_adsorbate_counts_structural(
     if unmatched_formulas:
         log.debug(
             "infer_adsorbate_counts_structural: %d molecule(s) did not "
-            "match any configured species: %s. Possible causes: bond "
-            "breaking/recombination during relaxation, or slab atom "
-            "extraction.",
+            "match any configured species: %s — falling back to greedy",
             len(unmatched_formulas), unmatched_formulas,
+        )
+        return infer_adsorbate_counts(
+            symbols_list[n_slab:], adsorbate_configs,
         )
 
     return counts

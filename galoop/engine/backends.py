@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import threading
 from typing import Any, Callable
 
@@ -83,10 +84,21 @@ def resolve(type_str: str) -> tuple[BackendFactory, bool]:
             )
         try:
             module = importlib.import_module(module_name)
-        except ImportError as exc:
-            raise ImportError(
-                f"Failed to import backend module {module_name!r}: {exc}"
-            ) from exc
+        except ImportError:
+            # If it's a bare module name (e.g. "calc"), the user likely has a
+            # calc.py in the run directory.  Add cwd to sys.path and retry.
+            import sys
+            cwd = os.getcwd()
+            if "." not in module_name and cwd not in sys.path:
+                sys.path.insert(0, cwd)
+                try:
+                    module = importlib.import_module(module_name)
+                except ImportError as exc2:
+                    raise ImportError(
+                        f"Failed to import backend module {module_name!r}: {exc2}"
+                    ) from exc2
+            else:
+                raise
         if not hasattr(module, attr):
             raise ValueError(
                 f"Module {module_name!r} has no attribute {attr!r}"
