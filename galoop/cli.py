@@ -101,6 +101,225 @@ def run(config: str, run_dir: str, seed: int | None, verbose: bool):
 
 
 # ---------------------------------------------------------------------------
+# calibrate
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--config", "-c", default="galoop.yaml",
+              type=click.Path(exists=True),
+              help="Path to galoop.yaml")
+@click.option("--run-dir", "-d", default=".", type=click.Path(),
+              help="Where to cache the calibration work (CONTCARs, ref energies)")
+@click.option("--write-yaml", is_flag=True,
+              help="After calibration, write slab.energy and each adsorbate's "
+                   "chemical_potential back into the source yaml in place. "
+                   "Subsequent `galoop run` will skip calibration.")
+@click.option("--force", is_flag=True,
+              help="Re-run calibration even if all values are already set.")
+@click.option("--verbose", "-v", is_flag=True)
+def calibrate(config: str, run_dir: str, write_yaml: bool, force: bool,
+              verbose: bool):
+    """Compute slab energy + adsorbate chemical potentials for a config.
+
+    By default, calibration runs every time `galoop run` starts if any
+    reference is missing. Calling this subcommand once with ``--write-yaml``
+    persists the computed values into the yaml, after which `galoop run`
+    will skip re-calibration.
+    """
+    logging.basicConfig(
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.DEBUG if verbose else logging.INFO,
+    )
+    log = logging.getLogger(__name__)
+
+    config_path = Path(config)
+    run_dir_path = Path(run_dir)
+    run_dir_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        cfg = load_config(str(config_path))
+    except Exception as exc:
+        log.error("Config validation failed: %s", exc)
+        sys.exit(1)
+
+    has_all = (
+        cfg.slab.energy is not None
+        and all(a.chemical_potential is not None for a in cfg.adsorbates)
+    )
+    if has_all and not force:
+        log.info("Config already has slab.energy and every chemical_potential set.")
+        log.info("  slab.energy = %.6f eV", cfg.slab.energy)
+        for a in cfg.adsorbates:
+            log.info("  mu(%s) = %.6f eV", a.symbol, a.chemical_potential)
+        log.info("Nothing to do. Use --force to re-run.")
+        return
+
+    if force:
+        cfg.slab.energy = None
+        for a in cfg.adsorbates:
+            a.chemical_potential = None
+
+    from galoop.calibrate import calibrate as _calibrate
+    try:
+        results = _calibrate(cfg, run_dir=run_dir_path)
+    except Exception:
+        log.exception("Calibration failed")
+        sys.exit(1)
+
+    log.info("Calibration results:")
+    log.info("  slab.energy = %.6f eV", cfg.slab.energy)
+    for a in cfg.adsorbates:
+        log.info("  mu(%s) = %.6f eV", a.symbol, a.chemical_potential)
+
+    if write_yaml:
+        try:
+            _write_calibrated_yaml(config_path, cfg)
+        except Exception:
+            log.exception("Failed to write yaml; calibration results are in "
+                          "%s/reference_energies.txt", run_dir_path / "calibration")
+            sys.exit(1)
+        log.info("Wrote calibrated values back to %s", config_path)
+    else:
+        log.info("Use --write-yaml to persist these values into %s", config_path)
+
+
+def _write_calibrated_yaml(yaml_path: Path, cfg) -> None:
+    """Splice the calibrated slab.energy and per-adsorbate chemical_potential
+    into an existing yaml file, preserving the rest of its structure.
+
+    Comments and key order are preserved as best as possible via PyYAML's
+    safe_load/safe_dump pair. This is not a comment-preserving round trip —
+    if that becomes important, swap for ruamel.yaml.
+    """
+    import yaml
+
+    with open(yaml_path) as f:
+        data = yaml.safe_load(f)
+
+    if cfg.slab.energy is not None:
+        data.setdefault("slab", {})
+        data["slab"]["energy"] = float(cfg.slab.energy)
+
+    ads_by_sym = {a.symbol: a for a in cfg.adsorbates}
+    for entry in data.get("adsorbates", []):
+        sym = entry.get("symbol")
+        a = ads_by_sym.get(sym)
+        if a is not None and a.chemical_potential is not None:
+            entry["chemical_potential"] = float(a.chemical_potential)
+
+    with open(yaml_path, "w") as f:
+        yaml.safe_dump(data, f, sort_keys=False, default_flow_style=False)
+
+
+# ---------------------------------------------------------------------------
+# sweep
+# ---------------------------------------------------------------------------
+
+@cli.command()
+@click.option("--config", "-c", required=True, type=click.Path(exists=True),
+              help="Sweep yaml: a list of run directories under 'runs:'")
+@click.option("--stop-on-failure", is_flag=True,
+              help="Abort the whole sweep if any single run raises.")
+@click.option("--verbose", "-v", is_flag=True)
+def sweep(config: str, stop_on_failure: bool, verbose: bool):
+    """Run a chained sequence of GA campaigns.
+
+    The sweep yaml lists run directories; each must contain its own
+    ``galoop.yaml``. Each campaign runs in the SAME Python process
+    sequentially — Parsl is initialised, torn down, and re-initialised
+    around each run, so backend caches (e.g. MLIP model weights) can
+    survive across runs within the same session for speed.
+
+    Example sweep.yaml:
+
+    \b
+        runs:
+          - runs/cu111_co_camp
+          - runs/cu100_co_camp
+          - runs/cu211_co_camp
+        stop_on_failure: false    # optional, default false
+    """
+    import time
+
+    import yaml
+
+    from galoop.galoop import run as run_ga
+    from galoop.science.surface import load_slab_from_config
+
+    logging.basicConfig(
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.DEBUG if verbose else logging.INFO,
+    )
+    log = logging.getLogger(__name__)
+
+    with open(config) as f:
+        sweep_cfg = yaml.safe_load(f) or {}
+    runs = sweep_cfg.get("runs", [])
+    if not runs:
+        log.error("Sweep config has no 'runs:' list")
+        sys.exit(1)
+    stop_on_failure = stop_on_failure or bool(sweep_cfg.get("stop_on_failure", False))
+
+    summary = []
+    t0_sweep = time.time()
+
+    for idx, run_dir_str in enumerate(runs, start=1):
+        run_dir = Path(run_dir_str).resolve()
+        yaml_path = run_dir / "galoop.yaml"
+        log.info("=" * 60)
+        log.info("sweep [%d/%d]  %s", idx, len(runs), run_dir)
+        log.info("=" * 60)
+
+        t0 = time.time()
+        status_str = "ok"
+        error_msg = ""
+
+        if not yaml_path.exists():
+            log.error("  no galoop.yaml in %s", run_dir)
+            summary.append((run_dir.name, "missing-config", 0.0, ""))
+            if stop_on_failure:
+                break
+            continue
+
+        try:
+            cfg = load_config(str(yaml_path))
+            needs_cal = (
+                cfg.slab.energy is None
+                or any(a.chemical_potential is None for a in cfg.adsorbates)
+            )
+            if needs_cal:
+                log.info("  auto-calibrating (consider `galoop calibrate "
+                         "--write-yaml` to persist)")
+                from galoop.calibrate import calibrate as _calibrate
+                _calibrate(cfg, run_dir=run_dir)
+
+            slab_info = load_slab_from_config(cfg.slab)
+            rng = np.random.default_rng()
+            run_ga(cfg, run_dir, slab_info, rng)
+        except Exception as exc:
+            log.exception("  run failed")
+            status_str = "failed"
+            error_msg = f"{type(exc).__name__}: {exc}"
+            summary.append((run_dir.name, status_str, time.time() - t0, error_msg))
+            if stop_on_failure:
+                break
+            continue
+
+        summary.append((run_dir.name, status_str, time.time() - t0, ""))
+
+    total = time.time() - t0_sweep
+    log.info("=" * 60)
+    log.info("sweep complete  total %.1fs  (%d/%d ok)",
+             total,
+             sum(1 for _, s, _, _ in summary if s == "ok"),
+             len(summary))
+    for name, s, dt, err in summary:
+        log.info("  %-30s  %-8s  %6.1fs  %s", name, s, dt, err)
+
+
+# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 
