@@ -295,13 +295,39 @@ class TestSnapTimeout:
                 min_adsorbates=1,
                 max_adsorbates=3,
             ),
-            slab=SimpleNamespace(snap_timeout_s=120.0),
+            slab=SimpleNamespace(snap_timeout_s=120.0, snap_z_min_offset=0.8, snap_z_max_offset=4.0),
         )
-        slab_info = SimpleNamespace(n_slab_atoms=len(stub_slab))
+        slab_info = SimpleNamespace(n_slab_atoms=len(stub_slab), atoms=stub_slab)
         store = _StubStore(run_dir)
 
+        # Mock snap_structure (Parsl task) to return a fake future that
+        # writes a CONTCAR and resolves immediately. Also track calls so
+        # we can verify galoopstop stopped early.
         import numpy as np
+        from concurrent.futures import Future
+        from ase.io import write as ase_write
+        from galoop.engine import scheduler as sched_mod
+
+        snap_call_count = {"n": 0}
+
+        def mock_snap_structure(**kwargs):
+            snap_call_count["n"] += 1
+            if snap_call_count["n"] == 2:
+                (run_dir / "galoopstop").touch()
+            # Write a CONTCAR_snap in the same dir as the POSCAR
+            poscar_path = kwargs["poscar_path"]
+            from pathlib import Path
+            contcar = Path(poscar_path).with_name("CONTCAR_snap")
+            ase_write(str(contcar), stub_slab.copy(), format="vasp")
+            fut = Future()
+            fut.set_result(str(contcar))
+            return fut
+
+        monkeypatch.setattr(sched_mod, "snap_structure", mock_snap_structure)
+        # Re-import snap_structure reference in spawn module
+        monkeypatch.setattr(spawn_mod, "snap_structure", mock_snap_structure, raising=False)
+
         spawn_mod.build_initial_population(cfg, slab_info, store, np.random.default_rng(0))
 
-        assert call_count["n"] == 2
+        assert snap_call_count["n"] >= 2
         assert len(store.inserted) < 10

@@ -22,6 +22,7 @@ import numpy as np
 from galoop.fingerprint import StructRecord
 from galoop.harvest import handle_converged, rebuild_struct_cache
 from galoop.individual import STATUS
+from galoop.gpr import effective_kappa as _effective_kappa
 from galoop.spawn import build_initial_population, fill_workers, retrain_gpr
 from galoop.store import GaloopStore
 
@@ -122,6 +123,7 @@ def run(
     # Parsl AppFuture; using Any so we don't take a hard type dep on parsl
     # internals (which lack stubs anyway).
     active_futures: dict[str, Any] = {}
+    pair_counts: dict = {}  # over-mating penalty; persists across poll cycles
 
     # Crash recovery: handle structures orphaned by a previous crash
     _recover_orphans(store, active_futures, stage_configs,
@@ -231,16 +233,13 @@ def run(
             # accumulate and bumps it up when stall_count grows, so a stuck
             # run is pushed back into exploration without operator
             # intervention.
-            from galoop.gpr import effective_kappa
-            kappa_now = effective_kappa(config, total_evals, stall_count)
+            kappa_now = _effective_kappa(config, total_evals, stall_count)
 
             if _should_stop(total_evals, stall_count, spawn_stall_count, config):
                 if not active_futures:
                     log.info("Convergence criteria met.")
                     break
             else:
-                pair_counts = {}
-
                 spawned = fill_workers(
                     store, config, slab_info, rng, total_evals,
                     active_futures, relax_structure, stage_configs,

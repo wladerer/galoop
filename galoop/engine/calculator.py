@@ -196,8 +196,12 @@ class CalculatorStage:
             log.warning("%s BFGS relax failed: %s", self.name, exc)
             converged = False
 
-        energy = float(atoms.get_potential_energy())
         n_steps = getattr(dyn, "nsteps", 0)
+        try:
+            energy = float(atoms.get_potential_energy())
+        except Exception:
+            energy = float("nan")
+            converged = False
 
         if not self._energy_sane(energy, atoms):
             converged = False

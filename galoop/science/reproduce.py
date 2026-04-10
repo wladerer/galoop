@@ -43,6 +43,11 @@ def _group_molecules(atoms: Atoms, n_slab: int, mult: float = 1.25) -> list[list
         for j in range(i + 1, n):
             cutoff = mult * (covalent_radii[nums[ads_indices[i]]]
                              + covalent_radii[nums[ads_indices[j]]])
+            # Use Cartesian distance (not MIC) for molecule grouping.
+            # MIC would falsely connect distinct molecules whose periodic
+            # images happen to be close. Molecules that genuinely straddle
+            # a cell boundary would be incorrectly split, but this is rare
+            # for surface adsorbates (vacuum in z, large xy period).
             if np.linalg.norm(pos[ads_indices[i]] - pos[ads_indices[j]]) < cutoff:
                 adj[i].append(j)
                 adj[j].append(i)

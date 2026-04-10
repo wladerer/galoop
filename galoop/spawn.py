@@ -391,8 +391,8 @@ def fill_workers(
         struct_dir = store.individual_dir(new_ind.id)
         poscar = struct_dir / "POSCAR"
         write(str(poscar), child_atoms, format="vasp")
+        new_ind = new_ind.with_status(STATUS.SUBMITTED)
         new_ind.geometry_path = str(poscar)
-        new_ind.status = STATUS.SUBMITTED
         store.update(new_ind)
 
         fut = relax_fn(
@@ -662,17 +662,24 @@ def spawn_via_gpr(gpr, store: GaloopStore, config, slab_info, rng,
 
 
 def retrain_gpr(gpr, store: GaloopStore) -> None:
-    """Retrain the GPR on all converged structures."""
+    """Retrain the GPR on all converged structures with valid GCE."""
     converged = store.get_by_status(STATUS.CONVERGED)
     if len(converged) < 2:
         return
-    compositions = [ind.extra_data.get("adsorbate_counts", {}) for ind in converged]
-    energies = [ind.grand_canonical_energy for ind in converged
-                if ind.grand_canonical_energy is not None]
-    if len(energies) < 2:
+    # Build both lists in lockstep so compositions[i] always pairs with
+    # energies[i]. The old code built them separately and truncated with
+    # [:len(energies)], which silently misaligned when None-energy
+    # individuals weren't at the tail.
+    pairs = [
+        (ind.extra_data.get("adsorbate_counts", {}), ind.grand_canonical_energy)
+        for ind in converged
+        if ind.grand_canonical_energy is not None
+    ]
+    if len(pairs) < 2:
         return
+    compositions, energies = zip(*pairs)
     try:
-        gpr.fit(compositions[:len(energies)], energies)
+        gpr.fit(list(compositions), list(energies))
     except Exception as exc:
         log.debug("GPR training failed: %s", exc)
 

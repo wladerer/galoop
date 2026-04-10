@@ -153,6 +153,9 @@ def handle_converged(
         # Log full traceback so we can spot systemic bugs (the MACE shape
         # mismatch hunt would have been hours shorter with this in place).
         log.exception("  %s: post-relax evaluation failed (%s)", ind.id, exc)
+        ind = ind.with_status(STATUS.FAILED)
+        ind.extra_data = {**ind.extra_data, "fail_reason": f"harvest_exception: {exc}"}
+        store.update(ind)
 
     return ind, total_evals, best_gce
 

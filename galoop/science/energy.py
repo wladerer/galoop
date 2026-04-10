@@ -75,10 +75,14 @@ def _get_species_metadata(symbol: str) -> dict:
     if symbol in _CHE_METADATA:
         return _CHE_METADATA[symbol]
 
-    # Infer: count O and H
-    n_O = symbol.count("O")
-    n_H = symbol.count("H")
-    has_other = any(c.isalpha() and c not in "OH" for c in symbol)
+    # Infer from parsed element counts (not string .count, which would
+    # match "O" inside "Co", "Mo", etc.)
+    from collections import Counter
+    from galoop.science.surface import parse_formula
+    elems = Counter(parse_formula(symbol))
+    n_O = elems.get("O", 0)
+    n_H = elems.get("H", 0)
+    has_other = bool(set(elems.keys()) - {"O", "H"})
 
     if has_other or (n_O == 0 and n_H == 0):
         # Contains C, N, etc. — treat as gas phase

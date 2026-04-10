@@ -130,6 +130,12 @@ class GaloopStore:
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     @property
     def workspace(self) -> Path:
         """Directory containing per-structure subdirectories."""
@@ -178,7 +184,7 @@ class GaloopStore:
     def insert(self, ind: Individual) -> Path:
         """Insert an Individual and return its structure directory."""
         self._conn.execute(
-            """INSERT OR IGNORE INTO structures
+            """INSERT INTO structures
                (id, parent_ids, operator, status, raw_energy,
                 grand_canonical_energy, weight, geometry_path, extra_data)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",

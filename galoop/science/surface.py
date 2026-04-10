@@ -446,11 +446,17 @@ def find_surface_sites(
             cutoff = bond_mult * (covalent_radii[nums[ii]] + covalent_radii[nums[jj]])
             d = slab.get_distance(ii, jj, mic=True)
             if d < cutoff * 1.5:
-                # Bridge site: midpoint (Cartesian, PBC approximation)
-                mid = 0.5 * (pos[ii] + pos[jj])
-                sites.append(mid)
+                # Bridge site: MIC-aware midpoint via fractional coords
+                cell = slab.get_cell()
+                frac_i = np.linalg.solve(cell.T, pos[ii])
+                frac_j = np.linalg.solve(cell.T, pos[jj])
+                diff = frac_j - frac_i
+                diff -= np.round(diff)  # minimum image in fractional
+                mid_frac = frac_i + 0.5 * diff
+                sites.append(mid_frac @ cell)
 
     # Hollow sites: centroids of bonded triangles
+    cell = slab.get_cell()
     for i in range(len(top_indices)):
         for j in range(i + 1, len(top_indices)):
             for k in range(j + 1, len(top_indices)):
@@ -464,8 +470,14 @@ def find_surface_sites(
                     covalent_radii[nums[ii]] + covalent_radii[nums[kk]],
                 ) * bond_mult * 1.5
                 if d_ij < max_cut and d_jk < max_cut and d_ik < max_cut:
-                    centroid = (pos[ii] + pos[jj] + pos[kk]) / 3
-                    sites.append(centroid)
+                    # MIC-aware centroid via fractional coords
+                    frac_i = np.linalg.solve(cell.T, pos[ii])
+                    frac_j = np.linalg.solve(cell.T, pos[jj])
+                    frac_k = np.linalg.solve(cell.T, pos[kk])
+                    d_ij_f = frac_j - frac_i; d_ij_f -= np.round(d_ij_f)
+                    d_ik_f = frac_k - frac_i; d_ik_f -= np.round(d_ik_f)
+                    centroid_frac = frac_i + (d_ij_f + d_ik_f) / 3
+                    sites.append(centroid_frac @ cell)
 
     return sites
 
