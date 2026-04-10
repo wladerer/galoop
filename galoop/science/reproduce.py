@@ -25,33 +25,57 @@ def _group_molecules(atoms: Atoms, n_slab: int, mult: float = 1.25) -> list[list
 
     Two adsorbate atoms are considered bonded when their distance is less than
     ``mult * (r_cov_i + r_cov_j)``.  This is element-aware and handles all
-    common adsorbates (CO, OH, NH3, hydrocarbons, …) without a hard-coded
+    common adsorbates (CO, OH, NH3, hydrocarbons, ...) without a hard-coded
     distance threshold.
+
+    Uses ASE's :class:`NeighborList` with PBC **disabled** for the
+    distance check. This is intentional: PBC-aware (MIC) distances
+    falsely connect distinct molecules whose periodic images happen to
+    be within the covalent cutoff (common on densely packed surfaces
+    where inter-molecular O--O or N--N contacts are < 1.8 A). Disabling
+    PBC means molecules that genuinely straddle a cell boundary get
+    split, but in practice surface adsorbates rarely straddle xy
+    boundaries because the slab cell is much larger than any single
+    molecule.
+
+    The NeighborList approach is O(N) via cell-list partitioning instead
+    of the previous O(N^2) brute-force loop, which matters on large
+    supercells at high coverage.
 
     Returns a list of groups, where each group is a list of absolute atom
     indices (>= n_slab).  Isolated atoms form single-atom groups.
     """
+    from ase.neighborlist import NeighborList, natural_cutoffs
+
     ads_indices = list(range(n_slab, len(atoms)))
     if not ads_indices:
         return []
 
-    pos = atoms.get_positions()
-    nums = atoms.get_atomic_numbers()
-    n = len(ads_indices)
-    adj: list[list[int]] = [[] for _ in range(n)]
-    for i in range(n):
-        for j in range(i + 1, n):
-            cutoff = mult * (covalent_radii[nums[ads_indices[i]]]
-                             + covalent_radii[nums[ads_indices[j]]])
-            # Use Cartesian distance (not MIC) for molecule grouping.
-            # MIC would falsely connect distinct molecules whose periodic
-            # images happen to be close. Molecules that genuinely straddle
-            # a cell boundary would be incorrectly split, but this is rare
-            # for surface adsorbates (vacuum in z, large xy period).
-            if np.linalg.norm(pos[ads_indices[i]] - pos[ads_indices[j]]) < cutoff:
-                adj[i].append(j)
-                adj[j].append(i)
+    # Build a temporary atoms object with PBC disabled so the neighbor
+    # list uses Cartesian distances (no MIC).
+    work = atoms.copy()
+    work.pbc = [False, False, False]
 
+    cutoffs = [mult * covalent_radii[atoms.numbers[i]] for i in range(len(atoms))]
+    nl = NeighborList(cutoffs, self_interaction=False, bothways=True, skin=0.0)
+    nl.update(work)
+
+    # Build adjacency only among adsorbate atoms
+    ads_set = set(ads_indices)
+    n = len(ads_indices)
+    idx_to_local = {idx: i for i, idx in enumerate(ads_indices)}
+    adj: list[list[int]] = [[] for _ in range(n)]
+    for idx in ads_indices:
+        neighbors, _ = nl.get_neighbors(idx)
+        for nbr in neighbors:
+            nbr = int(nbr)
+            if nbr in ads_set and nbr > idx:
+                i_local = idx_to_local[idx]
+                j_local = idx_to_local[nbr]
+                adj[i_local].append(j_local)
+                adj[j_local].append(i_local)
+
+    # Connected-components via DFS
     visited = [False] * n
     molecules: list[list[int]] = []
     for start in range(n):
