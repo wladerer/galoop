@@ -884,7 +884,69 @@ three metals. UMA's \texttt{oc20} head is capturing this without any
 explicit trend objective.
 \end{keyfindings}
 
-\paragraph{Pd(111) hydrogen saturation — the clean case.} A
+\paragraph{Cu(111) 6$\times$6 supercell — the ($\sqrt{3}\!\times\!\sqrt{3}$)R30$^\circ$ CO overlayer.}
+The ten-campaign sweep used 4$\times$4 supercells (16 surface sites).
+On Cu(111) the GA found $\theta_{\text{CO}} = 0.50$~ML (CO$=8$),
+\emph{above} the experimental room-temperature saturation of
+$\sim$0.33~ML. The explanation: a
+$(\sqrt{3}\!\times\!\sqrt{3})\text{R}30^\circ$ pattern has a 3-site
+unit cell that cannot tile cleanly onto a $4\times 4$ grid (4 is not
+divisible by $\sqrt{3}$), so the GA is geometrically frustrated into
+a denser packing.
+
+A follow-up campaign on a $6\times 6\times 3$ slab (108 atoms, 36
+surface sites) removes this frustration. The result
+(Figure~\ref{fig:6x6}):
+
+\begin{keyfindings}[6$\times$6 recovers the experimental CO phase]
+The winner has \textbf{CO$=12$ on 36 sites $= \theta_{\text{CO}} =
+0.33$~ML}, exactly the
+$(\sqrt{3}\!\times\!\sqrt{3})\text{R}30^\circ$ saturation coverage
+reported by Hollins \& Pritchard (1979) and Raval~\emph{et~al.}~(1988).
+No H$_2$O appears in any top-5 structure. H co-adsorbs at 5--6 atoms
+in fcc-hollow sites that do not compete with CO's atop sites. This is
+the first supercell in the campaign series large enough to host the
+experimental phase, and the GA finds it without any structural bias.
+\end{keyfindings}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.65\linewidth]{struct_cu111_6x6_camp.png}
+  \caption{Lowest-$G$ structure from the Cu(111) $6\times 6\times 3$
+  campaign: CO$=12$, H$=6$, $G=-716.64$~eV. The
+  $(\sqrt{3}\!\times\!\sqrt{3})\text{R}30^\circ$ CO arrangement is
+  visible in the top-down view: every third atop site is occupied,
+  forming the characteristic triangular lattice. Compare with the
+  $4\times 4$ winner at $\theta=0.50$~ML in
+  Figure~\ref{fig:structs}, which was forced into a denser packing by
+  geometric frustration.}
+  \label{fig:6x6}
+\end{figure}
+
+\begin{center}\small
+\begin{tabular}{lccc}
+\toprule
+              & $4\times 4$ (run \#1) & $6\times 6$ (this run) & experiment \\
+\midrule
+surface sites           & 16      & 36       & ---        \\
+best CO count           &  8      & 12       & ---        \\
+$\theta_{\text{CO}}$    & 0.50 ML & \textbf{0.33 ML} & 0.33 ML \\
+phase accommodated      & none    & $(\sqrt{3}\!\times\!\sqrt{3})\text{R}30^\circ$ & $(\sqrt{3}\!\times\!\sqrt{3})\text{R}30^\circ$ \\
+H$_2$O in top-5         & 2/5     & 0/5      & ---        \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{4pt}
+\noindent
+This result validates the forward-looking recommendation in
+Section~\ref{sec:forward}: moving to larger supercells is not just
+``more data at higher cost'' but qualitatively changes the answer by
+unlocking ordered phases that smaller cells cannot host. The GA found
+the right phase without being told about it --- purely from the
+energy landscape provided by UMA.
+
+\paragraph{Pd(111) hydrogen saturation --- the clean case.} A
 single-species, strong-binding, simple-chemistry run. The GA
 delivered $\theta_{\text{H}} = 1$~ML on a 16-site slab in 8~min of
 wall clock, with a monotone $G(\theta)$ curve and zero constraint
