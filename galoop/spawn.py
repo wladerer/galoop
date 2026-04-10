@@ -326,6 +326,7 @@ def fill_workers(
     pair_counts: dict | None = None,
     struct_cache: dict | None = None,
     gpr=None,
+    gpr_kappa: float | None = None,
 ) -> bool:
     """Spawn offspring until the worker pool is full, submit via Parsl.
 
@@ -359,7 +360,9 @@ def fill_workers(
         )
 
         if use_gpr:
-            result = spawn_via_gpr(gpr, store, config, slab_info, rng)
+            result = spawn_via_gpr(
+                gpr, store, config, slab_info, rng, kappa=gpr_kappa,
+            )
         else:
             result = spawn_one(store, config, slab_info, rng, pair_counts)
 
@@ -624,12 +627,20 @@ def spawn_random(store: GaloopStore, config, slab_info, rng):
     return ind, current
 
 
-def spawn_via_gpr(gpr, store: GaloopStore, config, slab_info, rng):
+def spawn_via_gpr(gpr, store: GaloopStore, config, slab_info, rng,
+                  kappa: float | None = None):
     """Generate a structure with a GPR-suggested composition.
+
+    *kappa* overrides ``config.ga.gpr_kappa`` so the loop can apply an
+    annealing/stall-aware schedule (see
+    :func:`galoop.gpr.effective_kappa`). Falls back to the static config
+    value when not provided, preserving the legacy behavior.
 
     Returns (Individual, Atoms) or None.
     """
-    counts = gpr.suggest(rng, kappa=config.ga.gpr_kappa)
+    if kappa is None:
+        kappa = config.ga.gpr_kappa
+    counts = gpr.suggest(rng, kappa=kappa)
 
     if sum(counts.values()) == 0:
         return None

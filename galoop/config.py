@@ -263,7 +263,36 @@ class GAConfig(BaseModel):
     )
     gpr_kappa: float = Field(
         default=1.5, ge=0.0,
-        description="UCB exploration parameter (higher = more exploration)",
+        description=(
+            "Initial UCB exploration parameter (higher = more exploration). "
+            "Decays over the run according to gpr_kappa_half_life and is "
+            "temporarily boosted when the run stalls."
+        ),
+    )
+    gpr_kappa_min: float = Field(
+        default=0.3, ge=0.0,
+        description=(
+            "Floor that the decayed kappa will not drop below. Once the "
+            "run has made many improvements, kappa is allowed to shrink "
+            "toward this value for increasingly exploitative search."
+        ),
+    )
+    gpr_kappa_half_life: int = Field(
+        default=50, ge=0,
+        description=(
+            "Number of converged evaluations over which kappa halves "
+            "(exponential decay). Set to 0 to disable decay and use the "
+            "old fixed-kappa behavior."
+        ),
+    )
+    gpr_kappa_stall_boost: float = Field(
+        default=1.5, ge=0.0,
+        description=(
+            "Additive kappa bump scaled by the current stall fraction. "
+            "At stall_count == max_stall the full boost is applied; at "
+            "stall_count == 0 it contributes nothing. Set to 0 to disable "
+            "the escape mechanism."
+        ),
     )
     operator_weights: OperatorWeightsConfig = Field(
         default_factory=OperatorWeightsConfig,
