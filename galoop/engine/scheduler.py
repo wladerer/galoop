@@ -21,22 +21,21 @@ install_rotating_handler()
 from parsl.app.app import python_app  # noqa: E402
 from parsl.config import Config  # noqa: E402
 from parsl.executors import HighThroughputExecutor  # noqa: E402
-from parsl.executors.high_throughput.executor import (  # noqa: E402
-    DEFAULT_LAUNCH_CMD,
-)
 from parsl.providers import LocalProvider, SlurmProvider, TorqueProvider  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-
-# Worker launch command that routes through the rotating-log wrapper
-# instead of parsl's default ``process_worker_pool.py``. The wrapper
-# installs the same log rotation patch in each worker subprocess
-# before calling parsl's worker entry point via runpy.
-GALOOP_WORKER_LAUNCH_CMD = DEFAULT_LAUNCH_CMD.replace(
-    "process_worker_pool.py",
-    "python -m galoop.engine._parsl_worker_wrapper",
-)
+# NOTE: we previously overrode HTEX's launch_cmd to route through
+# galoop.engine._parsl_worker_wrapper, which would have installed the
+# rotating-log patch in each worker subprocess. That approach broke
+# multiprocessing.spawn's pickling (process_worker_pool defines
+# `worker` in __main__, and runpy's transient __main__ namespace
+# makes it unpicklable). Reverted: workers use the default
+# process_worker_pool.py launch and get plain FileHandler logs.
+# The main-process parsl.log IS still patched via
+# install_rotating_handler() above. Worker manager.log is bounded by
+# DFK cleanup on normal exit (bug 4 fix); orphan workers can still
+# leak but that's a galoop-reap problem, not a log-rotation one.
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +210,7 @@ def build_parsl_config(config, run_dir=None) -> Config:
 
         executor = HighThroughputExecutor(
             label="slurm",
-            launch_cmd=GALOOP_WORKER_LAUNCH_CMD,
+
             worker_logdir_root=worker_log_dir,
             provider=SlurmProvider(
                 partition=resources.get("partition", "default"),
@@ -229,7 +228,7 @@ def build_parsl_config(config, run_dir=None) -> Config:
     elif sched_type == "pbs":
         executor = HighThroughputExecutor(
             label="pbs",
-            launch_cmd=GALOOP_WORKER_LAUNCH_CMD,
+
             worker_logdir_root=worker_log_dir,
             provider=TorqueProvider(
                 queue=resources.get("queue", "default"),
@@ -248,7 +247,7 @@ def build_parsl_config(config, run_dir=None) -> Config:
         # instance instead of being shared across threads.
         executor = HighThroughputExecutor(
             label="local",
-            launch_cmd=GALOOP_WORKER_LAUNCH_CMD,
+
             worker_logdir_root=worker_log_dir,
             max_workers_per_node=nworkers,
             provider=LocalProvider(
